@@ -1,3 +1,9 @@
+**Name: Inês Calado**
+**Student Number: 20260537**
+
+## Model Comparasion
+Logistic Regression achieves a train accuracy of 0.679 and a test accuracy of 0.678, nearly identical, meaning it performs consistently on both seen and unseen data. The Decision Tree achieves a train accuracy of 0.829 but a test accuracy of only 0.628, which is a clear sign of overfitting (it memorizes the training data instead of learning generalizable patterns, and its performance collapses on new data). Since the test accuracy and the near-zero train-test gap is what actually reflects real-world performance, Logistic Regression is the better model in this case.
+
 # Baseline Predictive Pipeline -- ETAI
 
 This is the **starting point** for your semester project: a small but *complete* predictive pipeline -- every piece a real project needs (entry point, config, data loading, preprocessing, model, evaluation), just kept as simple as possible for now.
