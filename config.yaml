@@ -18,3 +18,85 @@ model:
 
 output:
   results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
+
+diagnostics:
+  # columns used as predictors when testing whether a column's missingness
+  # is associated with anything else observable (chi-square + Cramer's V)
+  candidate_predictors: ["sex", "race", "age_cat", "c_charge_degree", "score_text"]
+
+  # domain rules: values outside these ranges are impossible, not just unusual --
+  # converted to NaN before anything downstream treats them as legitimate data
+  validity_rules:
+    age: "18 <= age <= 100"
+    decile_score: "1 <= decile_score <= 10"
+    juv_fel_count: "juv_fel_count >= 0"
+    priors_count: "0 <= priors_count <= 60"
+
+  # column used to check for repeated-record duplicates (in addition to exact-row duplicates)
+  id_column: "id"
+
+  # stand-in tokens for missing data that don't show up under .isna()
+  placeholder_tokens: ["-", "?", "n/a", "N/A", "na", "NA", ""]
+
+  # known spelling/casing variants, mapped to one canonical label per column
+  canonical_maps:
+    sex:
+      male: "Male"
+      female: "Female"
+    race:
+      african-american: "African-American"
+      african american: "African-American"
+      caucasian: "Caucasian"
+      hispanic: "Hispanic"
+      other: "Other"
+      asian: "Asian"
+      native american: "Native American"
+    c_charge_degree:
+      f: "F"
+      felony: "F"
+      m: "M"
+      misdemeanor: "M"
+    score_text:
+      low: "Low"
+      medium: "Medium"
+      high: "High"
+
+  # perfectly (or near-perfectly) redundant columns, dropped after the multicollinearity check
+  columns_to_drop: ["prior_offenses", "age_in_months", "juvenile_total"]
+
+  # cross-column consistency: a category label should match the bucket its own
+  # numeric source value falls into. Found by comparing age_cat against age and
+  # score_text against decile_score -- individually valid values that disagree
+  # with each other (e.g. age=55 but age_cat="Less than 25"). Mismatches get the
+  # category column set to NaN (the numeric source column is trusted, since it
+  # already passed validity_rules above).
+  bucket_consistency:
+    age_cat:
+      value_column: "age"
+      buckets:
+        - {max: 25, label: "Less than 25"}
+        - {min: 25, max: 45, label: "25 - 45"}
+        - {min: 45, label: "Greater than 45"}
+    score_text:
+      value_column: "decile_score"
+      buckets:
+        - {min: 1, max: 5, label: "Low"}
+        - {min: 5, max: 8, label: "Medium"}
+        - {min: 8, max: 11, label: "High"}
+
+# imputation + encoding/scaling recipe, driven by the verdict table's per-column
+# missingness diagnosis (see diagnostics.candidate_predictors above)
+preprocessing:
+  numeric_features: ["age", "juv_fel_count", "juv_misd_count", "juv_other_count", "priors_count"]
+  categorical_features: ["sex", "age_cat", "c_charge_degree"]
+  # MAR/MNAR columns (per the verdict table) -- get a "<col>_was_missing" flag
+  # before imputation, so the model can still see the pattern
+  mnar_columns: ["priors_count", "c_charge_degree"]
+  numeric_impute_strategy: "median"
+  categorical_impute_strategy: "most_frequent"
+  # winner of the encoder x scaler empirical grid (experiments/encoder_scaler_grid.py):
+  # "target" encoding beat onehot/ordinal/count consistently across 15 repeated splits;
+  # the scaler choice made no real difference (paired comparison came out as noise),
+  # so "standard" was kept as the conventional default
+  scaler: "standard"    # "standard", "minmax", "robust", or "none"
+  encoder: "target"      # "onehot", "ordinal", "count", or "target"
