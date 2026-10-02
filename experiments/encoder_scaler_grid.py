@@ -2,8 +2,7 @@
 One-off experiment (not part of the production pipeline): scores every
 encoder x scaler combination across repeated splits, to pick config.yaml's
 `preprocessing.encoder`/`preprocessing.scaler` with evidence instead of a
-guess. Mirrors notebooks/02_preprocessing.ipynb's Step 4/5, but reuses this
-project's real src/preprocessing.py functions instead of a notebook-only copy.
+guess. 
 
 Run with:
     python experiments/encoder_scaler_grid.py
@@ -19,11 +18,11 @@ from src.data import load_data
 from src.preprocessing import (
     _ENCODER_REGISTRY,
     _SCALER_REGISTRY,
-    add_missing_flags,
     build_column_transformer,
     clean_dataset,
     split_features_target,
-    split_train_test,
+    drop_duplicate_rows,
+    split_dev_test,
 )
 
 N_REPEATS = 15  # how many different splits to average each combination over (16 combinations)
@@ -42,7 +41,7 @@ def score_combination(X, y, extras, preprocessing_config: dict, encoder_name: st
     combo_config = {**preprocessing_config, "encoder": encoder_name, "scaler": scaler_name}
     scores = []
     for repeat in range(N_REPEATS):
-        X_train, X_test, y_train, y_test, _extras_train, _extras_test = split_train_test(
+        X_train, X_test, y_train, y_test, _extras_train, _extras_test = split_dev_test(
             X, y, extras, test_size=TEST_SIZE, random_state=repeat
         )
         # a 2-step pipeline: first clean/prepare the columns (this combo's encoder+scaler), then the model
@@ -63,12 +62,13 @@ def main():
     # clean once -- doesn't depend on which encoder/scaler is being tested
     df = load_data(config["data"]["path"])
     df_clean = clean_dataset(df, config["diagnostics"])
-    df_clean = add_missing_flags(df_clean, config["preprocessing"]["mnar_columns"])
+    df_clean = drop_duplicate_rows(df_clean, config["diagnostics"].get("id_column"))
     X, y, extras = split_features_target(
         df_clean,
         target=config["data"]["target"],
         sensitive_attr=config["data"]["sensitive_attr"],
         drop_columns=config["data"]["drop_columns"],
+        mnar_columns=config["preprocessing"]["mnar_columns"],
     )
 
     per_combo_scores = {}  # keeps all 15 accuracies per combination (needed later for the paired comparison)

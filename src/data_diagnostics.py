@@ -31,6 +31,9 @@ def test_missingness_mechanism(df: pd.DataFrame, target_col: str, candidate_pred
     No verdict_from_max_v helper here on purpose -- the MCAR/MAR/MNAR call is a
     judgment made once while reading this table, not a threshold to hardcode.
     """
+    # For a column, tests whether its missing values are linked to other columns (chi-square + Cramer's V),
+    # and returns the columns sorted by the strength of that link.
+
     indicator = df[target_col].isna()
     rows = []
     for predictor in candidate_predictors:
@@ -54,6 +57,7 @@ def flag_invalid_values(df: pd.DataFrame, rules: dict) -> pd.DataFrame:
     "18 <= age <= 100"). Any value that fails its rule is set to NaN --
     impossible but not missing is still missing.
     """
+    #impossible values turned to NaN
     out = df.copy()
     for column, rule in rules.items():
         values = pd.to_numeric(out[column], errors="coerce")
@@ -78,6 +82,9 @@ def find_bucket_mismatches(df: pd.DataFrame, value_col: str, bucket_col: str, bu
     cross-column inconsistencies individual-column rules can't see, e.g.
     age_cat disagreeing with age, or score_text disagreeing with decile_score.
     """
+# Flags rows where a category label disagrees with the bucket its own numeric value falls into
+# (e.g. age=55 but age_cat="Less than 25"). The numeric column is trusted, the label is not.
+
     values = pd.to_numeric(df[value_col], errors="coerce")
 
     def expected_label(v):

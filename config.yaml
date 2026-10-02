@@ -7,14 +7,33 @@ data:
   sensitive_attr: "race"          # excluded from model features, used only to audit fairness
   drop_columns: ["id", "decile_score", "score_text"]  # identifiers / COMPAS's own score, not our model's inputs
 
-split:
-  test_size: 0.2
+# the FINAL TEST SET: carved out once, stratified, locked. Never used to fit, tune, compare or
+# choose anything. Do not change these values afterwards -- a new seed gives a different test set.
+test_set:
+  size: 0.2
   random_state: 42
 
+# how models are evaluated: stratified k-fold cross-validation on the development set
+# (everything except the locked test set). Same random_state = same folds on every run and
+# for every model, so comparisons are like-for-like.
+cv:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  scoring: "accuracy"
+  n_jobs: 1             # -1 = all cores (only pays off for slow models, e.g. random forest)
+
 model:
-  type: "decision_tree"   # or "decision_tree"
-  params: {}
-   # max_iter: 1000
+  # one of: "dummy", "logistic_regression", "decision_tree", "random_forest"
+  # Chosen with experiments/improve_pipeline.py: random forest with limited depth and leaf size
+  # (untuned forests overfit: train 0.73 vs. validation 0.65) had the best CV accuracy.
+  type: "random_forest"
+  params:
+    n_estimators: 300
+    max_depth: 6
+    min_samples_leaf: 20
+    random_state: 42   # forests are random (bootstrap rows + random feature subsets): fix the seed
+    n_jobs: -1         # use every CPU core -- the trees are independent, so they train in parallel
 
 output:
   results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
@@ -92,11 +111,12 @@ preprocessing:
   # MAR/MNAR columns (per the verdict table) -- get a "<col>_was_missing" flag
   # before imputation, so the model can still see the pattern
   mnar_columns: ["priors_count", "c_charge_degree"]
-  numeric_impute_strategy: "median"
+  numeric_impute_strategy: "median"   # "median", "mean", or "knn" (KNNImputer; scaled first)
   categorical_impute_strategy: "most_frequent"
   # winner of the encoder x scaler empirical grid (experiments/encoder_scaler_grid.py):
   # "target" encoding beat onehot/ordinal/count consistently across 15 repeated splits;
   # the scaler choice made no real difference (paired comparison came out as noise),
   # so "standard" was kept as the conventional default
   scaler: "standard"    # "standard", "minmax", "robust", or "none"
+  random_state: 42      # seed for the target encoder's internal cross-fitting
   encoder: "target"      # "onehot", "ordinal", "count", or "target"

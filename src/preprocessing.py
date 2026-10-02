@@ -6,7 +6,7 @@ Two stages:
      violations -> NaN, category spelling cleanup, duplicate removal,
      redundant column drop). Still has NaNs when it's done -- it only
      flags problems, it doesn't fix them.
-  2. `add_missing_flags` -> `split_features_target` -> `split_train_test` ->
+  2. `split_features_target` (adds the missing flags) -> `split_dev_test` ->
      `build_column_transformer`: turns the cleaned-but-still-messy data into
      something a model can train on -- a "<col>_was_missing" flag for every
      MAR/MNAR column (see the verdict table), then a stratified split, then
@@ -21,17 +21,18 @@ alongside the data so it's still available afterwards -- not to train on,
 but to check whether the model treats different groups differently. See
 src/evaluate.py:fairness_report.
 """
-import warnings
-
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import train_test_split
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, OrdinalEncoder, RobustScaler, StandardScaler
-from category_encoders import CountEncoder, TargetEncoder
+from sklearn.preprocessing import (
+    MinMaxScaler, OneHotEncoder, OrdinalEncoder, RobustScaler, StandardScaler, TargetEncoder,
+)
+from category_encoders import CountEncoder
 
+from src.model import build_model
 from src.data_diagnostics import find_bucket_mismatches, flag_invalid_values, find_placeholder_rows
 
 
@@ -52,17 +53,13 @@ def clean_dataset(df: pd.DataFrame, diagnostics_config: dict) -> pd.DataFrame:
       1. placeholder tokens ("-", "?", ...) -> NaN
       2. domain-rule violations (impossible values) -> NaN
       3. category spelling variants -> one canonical label
-      4. drop exact full-row duplicates only -- a repeated id whose other columns
-         differ is NOT dropped (could be two genuinely different records that
-         happen to share an id), just flagged with a warning
-      5. drop perfectly/near-perfectly redundant columns
-      6. cross-column mismatches (age_cat vs age, score_text vs decile_score) -> NaN
+      4. drop perfectly/near-perfectly redundant columns
+      5. cross-column mismatches (age_cat vs age, score_text vs decile_score) -> NaN
      uses find_placeholder_rows/flag_invalid_values from data_diagnostics.py, the rest is local
     """
     placeholder_tokens = set(diagnostics_config.get("placeholder_tokens", []))
     canonical_maps = diagnostics_config.get("canonical_maps", {})
     validity_rules = diagnostics_config.get("validity_rules", {})
-    id_column = diagnostics_config.get("id_column")
     columns_to_drop = diagnostics_config.get("columns_to_drop", [])
 
     out = df.copy()
@@ -91,21 +88,20 @@ def clean_dataset(df: pd.DataFrame, diagnostics_config: dict) -> pd.DataFrame:
             mismatch = find_bucket_mismatches(out, spec["value_column"], bucket_col, spec["buckets"])
             out.loc[mismatch, bucket_col] = np.nan
 
-    out = out.drop_duplicates()  # exact full-row duplicates only
-
-    if id_column and id_column in out.columns:
-        # a repeated id with different data is NOT an exact duplicate -- don't
-        # silently drop it, it could be two real records that share an id
-        still_repeated = out[id_column].duplicated(keep=False)
-        if still_repeated.any():
-            n_ids = out.loc[still_repeated, id_column].nunique()
-            warnings.warn(
-                f"{n_ids} '{id_column}' value(s) repeat with different data across rows -- "
-                "kept as-is, not dropped, since they are not exact duplicates."
-            )
-
     out = out.drop(columns=[c for c in columns_to_drop if c in out.columns])  # drop redundant columns
 
+    return out
+
+
+def drop_duplicate_rows(df: pd.DataFrame, id_column: str = None) -> pd.DataFrame:
+    """
+    TRAINING DATA ONLY. Drops exact duplicate rows and repeated ids (keeping the first), so
+    the same person can't be counted twice -- or land in both the development and the
+    locked test set. Must run *before* `split_dev_test()`, never on data you're predicting for.
+    """
+    out = df.drop_duplicates()
+    if id_column and id_column in out.columns:
+        out = out.drop_duplicates(subset=id_column, keep="first")
     return out
 
 
@@ -114,6 +110,7 @@ def add_missing_flags(df: pd.DataFrame, mnar_columns: list) -> pd.DataFrame:
     Adds a `<col>_was_missing` column (0/1) for every column the verdict table
     diagnosed as MAR/MNAR, before it gets imputed with the median/mode
     """
+    # doing this allows the model to keep information about which rows are missing, learning with it if its missing, is connected to the target variable
     out = df.copy()
     for col in mnar_columns:
         if col in out.columns:
@@ -121,10 +118,14 @@ def add_missing_flags(df: pd.DataFrame, mnar_columns: list) -> pd.DataFrame:
     return out
 
 
-def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, drop_columns: list):
+def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, drop_columns: list,
+                          mnar_columns: list = ()):
     """
-    Splits a cleaned dataframe into (X, y, extras), splits the columns
+    Splits a cleaned dataframe into (X, y, extras), splits the columns.
+    Adds the `<col>_was_missing` flags first (see `add_missing_flags`), so anything that builds
+    X through this function -- training or label-free inference data -- gets them automatically.
     """
+    df = add_missing_flags(df, mnar_columns)
     y = df.get(target) # target variable we want to predict
 
     # kept aside (like race and score_text) for later evaluation, but not used as model input features
@@ -137,16 +138,22 @@ def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, dr
     return X, y, extras
 
 
-def split_train_test(X, y, extras, test_size: float, random_state: int):
+def split_dev_test(X, y, extras, test_size: float, random_state: int):
     """
-    Splits rows into train/test sets, keeping X, y, and extras row-aligned.
-    Random State (=42) fixes the randomness so the same split is reproduced every run.
-    stratify=y: Keeps the target's class proportion balanced across train and test.
+    Sets the final test set aside (replaces `split_train_test`).
+
+    Stratified split of X, y and extras (race/score_text, for the fairness report) together,
+    so all three stay row-aligned. Returns a *development* set and a *locked test set*:
+      - development set: everything we may learn from and compare models on. Cross-validation
+        splits it again into train/validation folds.
+      - locked test set: never used to fit, tune, compare or choose anything. Its size and
+        seed live in config.yaml's `test_set` section and must not change afterwards.
     """
-    X_train, X_test, y_train, y_test, extras_train, extras_test = train_test_split(
+    X_dev, X_test, y_dev, y_test, extras_dev, extras_test = train_test_split(
         X, y, extras, test_size=test_size, random_state=random_state, stratify=y
     )
-    return X_train, X_test, y_train, y_test, extras_train, extras_test
+    return X_dev, X_test, y_dev, y_test, extras_dev, extras_test
+
 
 # menu of config names -> (class, kwargs)
 # rescales numeric columns to a comparable range
@@ -157,12 +164,13 @@ _SCALER_REGISTRY = {
     "robust": (RobustScaler, {}),
 }
 
-#   turns categorical columns into numbers e
+# Encoders turn text categories into numbers. "target" replaces each category by its reoffending rate;
+# cv=StratifiedKFold(5) cross-fits it: each training row is encoded with the OTHER 4 parts, never its own label.
 _ENCODER_REGISTRY = {
-    "onehot": (OneHotEncoder, {"handle_unknown": "ignore"}),
-    "ordinal": (OrdinalEncoder, {"handle_unknown": "use_encoded_value", "unknown_value": -1}),
-    "count": (CountEncoder, {"handle_unknown": 0, "handle_missing": 0}),
-    "target": (TargetEncoder, {"handle_unknown": "value", "handle_missing": "value"}),
+    "onehot": lambda seed: OneHotEncoder(handle_unknown="ignore"),
+    "ordinal": lambda seed: OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+    "count": lambda seed: CountEncoder(handle_unknown=0, handle_missing=0),
+    "target": lambda seed: TargetEncoder(target_type="binary", cv=StratifiedKFold(5, shuffle=True, random_state=seed)),
 }
 
 # turns a chosen config name into the actual sklearn object it stands for
@@ -182,12 +190,20 @@ def build_column_transformer(preprocessing_config: dict) -> ColumnTransformer:
     categorical_strategy = preprocessing_config.get("categorical_impute_strategy", "most_frequent")
 
     scaler = _instantiate(_SCALER_REGISTRY, preprocessing_config.get("scaler", "standard"))
-    encoder = _instantiate(_ENCODER_REGISTRY, preprocessing_config.get("encoder", "onehot"))
+    encoder = _ENCODER_REGISTRY[preprocessing_config.get("encoder", "onehot")](preprocessing_config.get("random_state"))
 
-    numeric_pipeline = Pipeline([
-        ("impute", SimpleImputer(strategy=numeric_strategy)),
-        ("scale", scaler),
-    ])
+    if numeric_strategy == "knn":
+        # KNN measures distances between rows, so the columns must be on a comparable scale
+        # first (the scalers ignore NaNs while fitting); otherwise `age` would dominate
+        numeric_pipeline = Pipeline([
+            ("scale", scaler),
+            ("impute", KNNImputer(n_neighbors=preprocessing_config.get("knn_neighbors", 5))),
+        ])
+    else:
+        numeric_pipeline = Pipeline([
+            ("impute", SimpleImputer(strategy=numeric_strategy)),
+            ("scale", scaler),
+        ])
     categorical_pipeline = Pipeline([
         ("impute", SimpleImputer(strategy=categorical_strategy)),
         ("encode", encoder),
@@ -198,4 +214,16 @@ def build_column_transformer(preprocessing_config: dict) -> ColumnTransformer:
         ("numeric", numeric_pipeline, numeric_features),
         ("categorical", categorical_pipeline, categorical_features),
         ("indicators", "passthrough", indicator_columns),
+    ])
+
+#  Joins preprocessing and model in one Pipeline, so both are fitted only on the rows it trains on. This function avoids wirtting the same Pipeline code in multiple places (cross-validation, final test, encoder/scaler grid search, etc.)
+def make_pipeline(model_config: dict, preprocessing_config: dict) -> Pipeline:
+    """
+    Full leak-safe pipeline: preprocessing (imputation, encoding, scaling) followed by the model.
+    Because both live in one Pipeline, everything is re-fit on whichever rows it is trained on
+    (a holdout's training part, or each cross-validation fold).
+    """
+    return Pipeline([
+        ("prep", build_column_transformer(preprocessing_config)),
+        ("model", build_model(model_config)),
     ])
