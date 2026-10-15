@@ -19,10 +19,10 @@ import yaml
 from sklearn.metrics import accuracy_score, classification_report
 
 from src.data import load_data
+from src.model import build_pipeline
 from src.preprocessing import (
     clean_dataset,
     drop_duplicate_rows,
-    make_pipeline,
     split_dev_test,
     split_features_target,
 )
@@ -44,8 +44,8 @@ def main():
         X, y, extras, test_size=config["test_set"]["size"], random_state=config["test_set"]["random_state"],
     )
 
-    model = make_pipeline(config["model"], config["preprocessing"]).fit(X_dev, y_dev)
-    dummy = make_pipeline({"type": "dummy", "params": {}}, config["preprocessing"]).fit(X_dev, y_dev)
+    model = build_pipeline(config["preprocessing"], config["model"]).fit(X_dev, y_dev)
+    dummy = build_pipeline(config["preprocessing"], {"type": "dummy", "params": {}}).fit(X_dev, y_dev)
     pred = model.predict(X_test)
     compas = (extras_test["score_text"] != "Low").astype(int)
 

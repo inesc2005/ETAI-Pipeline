@@ -32,7 +32,6 @@ from sklearn.preprocessing import (
 )
 from category_encoders import CountEncoder
 
-from src.model import build_model
 from src.data_diagnostics import find_bucket_mismatches, flag_invalid_values, find_placeholder_rows
 
 
@@ -115,6 +114,37 @@ def add_missing_flags(df: pd.DataFrame, mnar_columns: list) -> pd.DataFrame:
     for col in mnar_columns:
         if col in out.columns:
             out[f"{col}_was_missing"] = out[col].isna().astype(int)
+    return out
+
+
+# Week 6 (Challenge 1): fixed limits for priors_bin, chosen by hand as round numbers
+# (none / a few / several / many priors) -- not computed from the data
+PRIORS_BIN_EDGES = [-0.5, 0.5, 3.5, 9.5, float("inf")]   # -> 0 | 1-3 | 4-9 | 10+
+
+
+def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds 5 new columns, each a fixed formula (nothing learned from the data), so it is safe before the split. 
+    Missing inputs give NaN, imputed later in the Pipeline. The model only uses the columns listed in `preprocessing.numeric_features` (config.yaml).
+      - priors_per_adult_year: priors_count / (age - 17) 
+      - has_juvenile_record:   1 if any juvenile count > 0   (attempt 1)
+      - priors_bin:            priors_count in groups 0 | 1-3 | 4-9 | 10+   (attempt 1)
+      - felony_with_priors:    priors_count if the charge is a felony, else 0   (attempt 2)
+      - log_priors:            log(1 + priors_count)   (attempt 2)
+    """
+    out = df.copy()
+    out["priors_per_adult_year"] = out["priors_count"] / (out["age"] - 17).clip(lower=1)
+
+    juv = out[["juv_fel_count", "juv_misd_count", "juv_other_count"]]
+    any_positive = (juv > 0).any(axis=1)        # one positive count is enough to know the answer
+    all_known = juv.notna().all(axis=1)         # otherwise, all three must be known to say "no"
+    out["has_juvenile_record"] = any_positive.astype(float).where(any_positive | all_known)
+
+    out["priors_bin"] = pd.cut(out["priors_count"], bins=PRIORS_BIN_EDGES, labels=False)
+
+    is_felony = out["c_charge_degree"].map({"F": 1.0, "M": 0.0})   # unknown charge -> NaN
+    out["felony_with_priors"] = out["priors_count"] * is_felony
+    out["log_priors"] = np.log1p(out["priors_count"])
     return out
 
 
@@ -214,16 +244,4 @@ def build_column_transformer(preprocessing_config: dict) -> ColumnTransformer:
         ("numeric", numeric_pipeline, numeric_features),
         ("categorical", categorical_pipeline, categorical_features),
         ("indicators", "passthrough", indicator_columns),
-    ])
-
-#  Joins preprocessing and model in one Pipeline, so both are fitted only on the rows it trains on. This function avoids wirtting the same Pipeline code in multiple places (cross-validation, final test, encoder/scaler grid search, etc.)
-def make_pipeline(model_config: dict, preprocessing_config: dict) -> Pipeline:
-    """
-    Full leak-safe pipeline: preprocessing (imputation, encoding, scaling) followed by the model.
-    Because both live in one Pipeline, everything is re-fit on whichever rows it is trained on
-    (a holdout's training part, or each cross-validation fold).
-    """
-    return Pipeline([
-        ("prep", build_column_transformer(preprocessing_config)),
-        ("model", build_model(model_config)),
     ])

@@ -1,6 +1,108 @@
 **Name: Inês Calado**
 **Student Number: 20260537**
 
+## Week 5 e 6 -- hyperparameter tuning, and ensembles
+
+## Part 1 -- continuing week 4: hyperparameter tuning without leakage
+
+The goal: compare each model with its **default** hyperparameters against the **tuned** version, with an honest number for the tuned one.
+
+### What was added, and where
+
+- **`src/tuning.py`** (new)
+  - `tune_pipeline` -- an Optuna study (seeded TPE sampler). Each trial reads its ranges from the search space in `config.yaml`, sets the values on a fresh, unfitted copy of the whole pipeline (`clone` + `set_params`) and scores it by its mean CV accuracy. Returns the best pipeline (unfitted) and the study.
+  - `nested_cross_validate` -- the honest estimate of "tune, then refit": for each outer fold, the tuning runs on the outer-training rows only and the winner is scored on the outer-validation rows, which took no part in choosing it. Same output format as `cross_validate_pipeline`, plus `inner_best` (the tuning score inside that fold) and the hyperparameters chosen.
+  - `tuning_report` -- best hyperparameters, top trials, and the optimism check (mean `inner_best` vs. mean outer validation).
+- **`src/model.py`** -- `build_pipeline(preprocessing_config, model_config)` replaces `make_pipeline` (which moved out of `src/preprocessing.py`): one place builds the preprocessing + model `Pipeline` for `main.py`, tuning and the experiments.
+- **`main.py`** -- after the usual CV (hyperparameters from `config.yaml`), if `tuning.enabled`: nested CV (its out-of-fold predictions now feed the classification report and fairness check), then tuning on all development rows, then the tuned pipeline is refit on all development rows.
+- **`config.yaml`** -- new `tuning` section (on/off, `n_trials`, inner `n_splits`, `random_state`, one search space per model type: decision tree, logistic regression, random forest); `model` is now the decision tree with default hyperparameters.
+- **`src/results.py`** -- the run header records the tuning settings.
+- **`requirements.txt`** -- `optuna>=4.0`.
+
+### Hyperparameter tuning
+
+**How it works.** Hyperparameters are chosen with **Optuna** (TPE sampler, seed 42): 30 trials for the decision tree and logistic regression, 15 for the random forest (each trial is much slower, so the budget was halved, following the suggestion of the class notebook). `n_trials` is a single value in `config.yaml`: to reproduce a row, set `model` and `n_trials` as described in the comments of `config.yaml` (30 for the first two rows, 15 for the random forest). Every trial is scored by stratified 5-fold CV of the **whole** pipeline on the development set (inner folds, seed 42), so imputer, encoder and scaler are re-fit in every fold of every trial, and every candidate is scored on the same folds. Search spaces: decision tree `max_depth` 1-20, `min_samples_leaf` 1-200 (log), `criterion`; logistic regression `C` 0.0001-100 (log); random forest `n_estimators` 50-200, `max_depth` {3, 5, 8, 12, 20, None}, `min_samples_leaf` 1-200 (log), `max_features` {sqrt, log2, 0.5, 1.0}.
+
+**Why it doesn't leak.** The test set stays locked (tuning sees only the development set); preprocessing is inside the `Pipeline`, so it is never fitted on validation rows; and the score reported for the tuned model is not the best trial's score (the maximum of many noisy scores, so optimistic) but the **nested CV** one, where each outer fold is scored by a model whose tuning never saw it.
+
+| Model | Default: CV mean ± std (gap) | Tuned: nested CV mean ± std (gap) | Tuning score (best trial) | Optimism | Chosen hyperparameters |
+|---|---|---|---|---|---|
+| Decision tree | 0.614 ± 0.014 (+0.082) | 0.678 ± 0.020 (+0.007) | 0.680 | -0.002 | `max_depth=6`, `min_samples_leaf=110`, `criterion=entropy` |
+| Logistic regression | 0.672 ± 0.013 (+0.003) | 0.674 ± 0.014 (+0.004) | 0.678 | +0.003 | `C=0.079` |
+| Random forest | 0.649 ± 0.019 (+0.084) | 0.680 ± 0.015 (+0.010) | 0.682 | +0.001 | `n_estimators=96`, `max_depth=12`, `min_samples_leaf=36`, `max_features=0.5` |
+
+Defaults: sklearn defaults (decision tree `random_state=42`; logistic regression `max_iter=2000`; random forest `n_estimators=200`). Optimism = mean `inner_best` minus mean nested validation. Full runs: `results/week5_*.txt`.
+
+The models that gained from tuning are the two that overfit with their defaults: the decision tree (+0.064) and the random forest (+0.031), both well above the fold-to-fold std (~0.015-0.020), and both lose almost all of their train-validation gap (0.08 -> ~0.01), reducing overfitting. The chosen trees are limited in size (large leaves of 36-110 people), which matches the week 4 finding that complexity was the problem. Logistic regression barely changed (+0.002, far inside the std): it has one main hyperparameter, it was not overfitting, and a linear model has little variance to remove. 
+Tuning did change which model is best: by default logistic regression was clearly ahead. After tuning the three models are tied (0.674-0.680, differences smaller than the std), with the random forest slightly ahead. For the random forest I would report the **nested CV score, 0.680 ± 0.015**, not the best trial's 0.682 or week 4's hand-picked 0.682, because those were chosen and scored on the same folds and are optimistic.
+
+**About the optimism.** In theory the tuning score (`inner_best`) should be slightly higher than the honest one (`validation`), because it is the maximum of many noisy scores. Here the optimism is between -0.002 and +0.003, which is smaller than the fold-to-fold noise (std of the nested validation score: 0.014-0.020). So it cannot be clearly told apart from that noise: for the decision tree it even came out negative (-0.002), which does not mean that the tuning underestimated the model, only that the true optimism is too small to be seen with 5 outer folds. This is expected here: the data has 5771 development rows, only 30 trials (15 for the random forest) and the candidates really differ from each other (the depth and leaf size change the score a lot), so the winner wins because it is better and not only because it was lucky. The noise itself is not an advantage: it is a limit of the data, and it is why differences of 0.002-0.006 between models (such as the three tuned models) should not be read as one model being better than another.
+
+## Part 2 -- ensembles 
+
+The goal: add two new ensembles of trees to the pipeline, tune all three ensembles with the Part 1 machinery, and compare them with the models so far on the same folds.
+
+### What was added, and where
+
+- **`src/model.py`** -- two new model types, registered in `_MODELS` (so `model.type` in `config.yaml` can be `"oblique_random_forest"` or `"adaboost"`). They are functions and not scikit-learn classes, because `config.yaml` can only hold numbers and text:
+  - `adaboost()` -- AdaBoost over decision trees of depth `max_depth` (1 = stumps): trees built one after another, each focused on the rows the previous ones got wrong, combined by a weighted vote. The function builds the base tree from the number `max_depth`.
+  - `oblique_random_forest()` -- a forest of oblique trees (splits on combinations of features,  diagonal lines). scikit-learn has no such model, so it is assembled: `SparseRandomProjection` (random combinations of the features) + a decision tree, inside a `BaggingClassifier` that fits many of them on bootstrap samples and averages them.
+- **`config.yaml`** -- `model` is now the random forest (200 trees), with the other models' default `params` as comments; search spaces for the three ensembles. The two forests (random forest and oblique random forest) tune the size of their trees (`max_depth`, `min_samples_leaf`) and how different the trees are (`max_features` / `n_components`), but not the number of trees: in a forest more trees never overfit, they only cost time, so for the random forest and the oblique random forest `n_estimators` is fixed at 200 in `params`. AdaBoost is different: its `n_estimators` (the number of rounds, 25-400) is tuned, together with its base trees' depth (1-8) and its learning rate (0.01-1.0), because in AdaBoost more rounds or stronger trees can overfit. The random forest search space therefore changed from Part 1 (which also tuned `n_estimators`); the Part 1 one is kept as a comment in `config.yaml`.
+- `src/tuning.py` and the reports did not change: they work through `build_pipeline()` and the config.
+- **`src/preprocessing.py`** and **`main.py`** (Challenge 1) -- new `add_engineered_features()`, called in `main.py` after `drop_duplicate_rows()` and before `split_features_target()` (see "Challenge 1" below).
+
+### Ensembles
+
+Every row comes from `python main.py` with that `model.type` and tuning on (30 trials, 5 inner folds, the same 5 outer folds for every model). The logistic regression and decision tree rows are the Part 1 runs; the three ensembles are new runs (`results/week5_part2_*.txt`, 7-13 minutes each).
+
+| Model | Default: CV mean ± std (gap) | Tuned: nested CV mean ± std (gap) | Tuning score (best trial) | Chosen hyperparameters |
+|---|---|---|---|---|
+| Logistic regression | 0.672 ± 0.013 (+0.003) | 0.674 ± 0.014 (+0.004) | 0.678 | `C=0.079` |
+| Decision tree | 0.614 ± 0.014 (+0.082) | 0.678 ± 0.020 (+0.007) | 0.680 | `max_depth=6`, `min_samples_leaf=110`, `criterion=entropy` |
+| Random forest | 0.649 ± 0.019 (+0.084) | 0.682 ± 0.015 (+0.008) | 0.684 | `max_depth=29`, `min_samples_leaf=61`, `max_features=0.5` |
+| Oblique random forest | 0.645 ± 0.015 (+0.118) | 0.682 ± 0.016 (+0.008) | 0.683 | `max_depth=22`, `min_samples_leaf=195`, `n_components=9` |
+| AdaBoost | 0.676 ± 0.013 (+0.006) | 0.681 ± 0.014 (+0.006) | 0.684 | `max_depth=4`, `n_estimators=220`, `learning_rate=0.025` |
+
+Defaults: random forest and oblique random forest with 200 trees (oblique: 10 combinations per tree); AdaBoost with stumps, 200 rounds, `learning_rate=1.0`. The random forest row differs slightly from Part 1 (0.682 vs 0.680) because of the new search space.
+
+After tuning, the five models are between 0.674 and 0.682: a spread of 0.008, smaller than the fold-to-fold std (0.013-0.020), so no model is clearly better than the others. The random forest and the oblique random forest share the highest mean (0.682); I would choose the random forest as the best one, because the oblique splits add nothing here (same score), and the random forest is a standard scikit-learn model and about twice as fast to tune (7 vs 13 minutes). The chosen hyperparameters match how each model works: the forests chose deep trees (depth 29 and 22) but with large leaves (61 and 195 people), because a forest averages fairly complex trees and it is the leaf size, not the depth, that stops them from memorising single people overfitting; AdaBoost chose shallow trees (depth 4) and a small learning rate (0.025), because boosting wants weak learners and small steps. 
+This is also why tuning helped the forests most (random forest +0.033 = 0.682 - 0.649, oblique random forest +0.037 = 0.682 - 0.645; both overfitting by default with gaps of +0.084 and +0.118) and AdaBoost very little (+0.005 = 0.681 - 0.676; its stumps were not overfitting). After tuning, the overfitting is gone where it existed: the gap of the random forest and the oblique random forest drops to +0.008, and all five tuned models have a gap below 0.01. 
+To conclude, I would say the best model is the random forest: it is tied with the others within the noise, but it has the highest mean together with the oblique random forest and is the simpler and faster of the two. The number I would report for it is its nested CV score, 0.682 ± 0.015, not its best trial (0.684), which is optimistic.
+
+### Challenge 1 -- feature engineering
+
+**What was done.** `add_engineered_features()` in `src/preprocessing.py` adds new columns built from the existing ones. It is called in `main.py` after `drop_duplicate_rows()` and before `split_features_target()`. Every feature is a fixed formula: nothing is learned from the data (no median, no mean, no target), so it is safe to compute before the split and on new data, like the `_was_missing` flags. (A feature such as "priors above the median" would need the median, so it would have to be a step inside the `Pipeline` instead.) A missing input gives a missing feature, which is imputed later inside the `Pipeline` like any other numeric column. A new column is only used by the model if it is listed in `preprocessing.numeric_features`; the `ColumnTransformer` drops the others.
+
+I tried two sets of features, each together with the class notebook's example:
+
+| Feature | Formula | Idea | Attempt |
+|---|---|---|---|
+| `priors_per_adult_year` | `priors_count / (age - 17)` | 2 priors at 19 and 2 priors at 45 are very different histories; a tree can't divide one column by another (class notebook example) | 1 and 2 |
+| `has_juvenile_record` | 1 if any of `juv_fel_count`, `juv_misd_count`, `juv_other_count` is above 0, else 0 | having a juvenile record at all, as one yes/no answer | 1 |
+| `priors_bin` | `priors_count` in fixed bins 0 / 1-3 / 4-9 / 10+, coded 0-3 | none / a few / several / many priors | 1 |
+| `felony_with_priors` | `priors_count` if the current charge is a felony (`F`), 0 if a misdemeanour (`M`) | an interaction: the priors only count when the current charge is serious; the model only saw these two columns separately | 2 |
+| `log_priors` | `log(1 + priors_count)` | the first priors weigh more than the twentieth; logistic regression can only use `priors_count` as a straight line | 2 |
+
+The `priors_bin` edges are round numbers chosen by hand, after looking at the distribution of `priors_count` (on all rows, so the test set too); they were not tuned on any score.
+
+The two features of attempt 2, with examples:
+- **`felony_with_priors`** joins two pieces of information the model only saw separately: the number of priors and the type of the current charge. Two people with 5 priors each get different values: one charged with a felony (serious) gets 5, the other charged with a misdemeanour (minor) gets 0. In other words, it captures people who have many priors and are now facing a serious charge, a combination that may signal a higher risk than either fact on its own. Logistic regression cannot create this combination by itself, since it only adds up the separate effect of each column, so the feature provides it directly.
+- **`log_priors`** changes the scale of `priors_count` so that the first priors count more than the later ones: moving from 0 to 1 prior (from no record to a first offence) reveals a lot about a person, whereas moving from 10 to 11 adds very little. `priors_count` treats both steps as the same (+1), while `log_priors` goes 0 -> 0.69 for the first prior but only 2.40 -> 3.04 from 10 to 20 priors. Logistic regression gives every extra prior the same weight; with the log, each extra prior weighs less and less.
+
+**Results.** The table compares the nested CV score of each model with and without the new features. All runs use 30 trials and the same 5 outer folds, so the only difference is the features.
+The 'without' scores are the ones from the tables above (the new columns are only used when listed in numeric_features, so adding the function to main.py does not change them).
+Full runs: `results/week5_part2_features_v1_*.txt` (attempt 1) and `results/week5_part2_features_v2_*.txt` (attempt 2).
+
+| Model | Without new features | Attempt 1 (`has_juvenile_record`, `priors_bin`) | Attempt 2 (`felony_with_priors`, `log_priors`) |
+|---|---|---|---|
+| Logistic regression | 0.674 ± 0.014 | 0.675 ± 0.010 (+0.001, better in 3/5 folds) | 0.675 ± 0.012 (+0.001, better in 2/5 folds) |
+| Random forest | 0.682 ± 0.015 | 0.674 ± 0.010 (-0.008, better in 1/5 folds) | 0.672 ± 0.009 (-0.009, better in 1/5 folds) |
+| AdaBoost | 0.681 ± 0.014 | 0.677 ± 0.011 (-0.004, better in 1/5 folds) | 0.676 ± 0.012 (-0.005, better in 0/5 folds) |
+
+**Which model family gains, and by more than the fold std?** None. Logistic regression is the only one that doesn't lose, but its gain (+0.001) is far below the fold std (0.010-0.014) and the folds go both ways. The tree models (random forest and AdaBoost) got slightly worse in both attempts, in almost every fold; the losses are also smaller than the fold std, so they are not clearly significant, but the direction is consistent. A likely reason is that trees can already build these features themselves with a few splits on `priors_count`, `age` and `c_charge_degree`, so the new columns add no information, only more similar columns, i.e. more ways to fit noise. Since two different kinds of features (indicators/bins and an interaction/a transformation) failed in the same way, the limit seems to be the information in the original columns, not the way it is presented to the models.
+
+**Which set I keep.** Both attempts give the same scores, so the choice is about the idea, not the number: I prefer attempt 2, because `felony_with_priors` combines two columns the model only saw separately, and `log_priors` tests a clear idea for logistic regression; in attempt 1, `has_juvenile_record` is almost the `juvenile_total` column I dropped in week 3 as redundant, and `priors_bin` is only `priors_count` in groups. Since neither set improves the models, none of the new features is listed in `preprocessing.numeric_features`: the final model is still the random forest without them (0.682 ± 0.015). `add_engineered_features()` still computes all five, and the comments in `config.yaml` list them and say how to switch them on.
+
 ## Week 4 -- holdout vs. cross-validation, a locked test set, and a better pipeline
 
 Before starting week 4, I corrected a few mistakes and unclear explanations I had in the week 3 section of this README.
@@ -11,7 +113,7 @@ Before starting week 4, I corrected a few mistakes and unclear explanations I ha
 - **`src/preprocessing.py`**
   - `make_pipeline(model_config, preprocessing_config)` joins the preprocessing and the model into one leak-safe `Pipeline`, so it is re-fit on whichever rows it trains on (a holdout's training part, or each CV fold).
   - The `target` encoder is now sklearn's `TargetEncoder`, which cross-fit: each training row is encoded with category means computed on the *other* internal folds, never on its own label. The previous `category_encoders` version leaked a row's own target into its own feature, which inflated train accuracy (random forest: train 0.79 -> 0.73, train-test gap +0.150 -> +0.082 after the change).
-  - - `drop_duplicate_rows` is a separate step, used only on the training data (it drops exact duplicate rows and repeated ids, keeping the first). It runs before the split, so the same person cannot end up in both the development set and the test set. `clean_dataset` now keeps every row.
+  - `drop_duplicate_rows` is a separate step, used only on the training data (it drops exact duplicate rows and repeated ids, keeping the first). It runs before the split, so the same person cannot end up in both the development set and the test set. `clean_dataset` now keeps every row.
   - `split_dev_test` replaces `split_train_test`: it sets a locked test set aside (`test_set` in `config.yaml`). Nothing is fitted, tuned, compared or chosen on it.
   - `numeric_impute_strategy: "knn"` adds a `KNNImputer` option (the scaler runs first, since KNN uses distances).
 - **`src/evaluate.py`** -- `cross_validate_pipeline` (stratified k-fold CV of the whole pipeline, returns per-fold train/validation scores and out-of-fold predictions), `cv_report` (mean and std), `oof_classification_report`. The fairness check now runs on the out-of-fold predictions of the development set.
@@ -72,7 +174,6 @@ This comparison was run with `experiments/improve_pipeline.py`. Each variant cha
 - **Preprocessing changes hardly matter.** The KNN imputer was slightly *worse* than the median; encoder and scaler changes are within the noise. The missing-value flags and a stronger regularisation help a little (+0.005).
 - **What matters is limiting model complexity.** The untuned Decision Tree and Random Forest overfit; capping depth and leaf size removes the train-validation accuracy gap (0.083 -> 0.007) and makes the Random Forest the best model.
 - **Final model:** Random Forest (`n_estimators=300`, `max_depth=6`, `min_samples_leaf=20`), mean accuracy 0.682 +/- 0.015 (cross-validation). The gain over Logistic Regression (+0.010, SE 0.005) is small: "slightly better"
-- **Locked test set, evaluated once** (`experiments/final_test.py`, model fitted on the whole development set): accuracy **0.670**, vs. 0.550 for the dummy and 0.654 for COMPAS's own score on the same rows. It falls inside the CV spread (0.682 +/- 0.015), as it should if the CV estimate was honest.
 - **Locked test set, evaluated once** (`experiments/final_test.py`): the final model was fitted on the whole development set and then scored on the test set, which had never been used for training, tuning or choosing anything. Accuracy: **0.670**, against 0.550 for the dummy and 0.654 for COMPAS's own score on the same people. This agrees with what cross-validation had predicted (0.682 +/- 0.015): the test result falls inside that range, which suggests the cross-validation estimate was honest and not too optimistic.
 
 **Next steps.** Each hyperparameter was tried with a single value (Decision Tree: `max_depth=5`, `min_samples_leaf=50`; Random Forest: `max_depth=6`, `min_samples_leaf=20`), only compared with the default (no limit). A natural improvement is to try several values of each one (`max_depth` = 3, 5, 8, 12) and keep the best one.
@@ -135,8 +236,7 @@ The positive class is "will reoffend" (`two_year_recid = 1`). TP = predicted "wi
 
 Test accuracy did not improve. It dropped slightly for both models, and F1 on the recidivism class (the harder, more practically relevant class) dropped too (Logistic: 0.63 -> 0.56; Decision Tree: 0.54 -> 0.51). What did improve: the Decision Tree's train-test gap (0.201 -> 0.178), a sign of somewhat less overfitting, and the pipeline itself became more structured: no rows thrown away for having a missing value (imputed instead), no target leakage into imputation/encoding/scaling (fit only on the training fold), and the encoder/scaler choice is backed by evidence instead of a guess (see `experiments/encoder_scaler_grid.py`: `target` encoding beat `onehot`/`ordinal`/`count` consistently across 15 repeated splits); the scaler choice made no statistically real difference. A paired comparison between the top 2 combinations came out as noise, SE larger than the observed gap.
 
-In conclusion, better data cleaning did not lead to a better score. That suggests the model itself (a plain Logistic Regression / Decision Tree) is what's limiting accuracy right now, not the data. So more time spent preprocessing probably won't help much. Maybe trying a stronger model next is more likely to.
-ange: with these features (age, sex, priors, charge) recidivism is inherently noisy, which is also why COMPAS itself only reaches 0.65.
+In conclusion, better data cleaning did not lead to a better score. That suggests the model itself (a plain Logistic Regression / Decision Tree) is what's limiting accuracy right now, not the data. So more time spent preprocessing probably won't help much. Maybe trying a stronger model next is more likely to. Another possible reason: with these features (age, sex, priors, charge) recidivism is inherently noisy, which is also why COMPAS itself only reaches 0.65.
 
 
 ## Model Comparison - Week 2
@@ -166,8 +266,9 @@ go on.
 │   ├── data.py               # loading
 │   ├── data_diagnostics.py   # missingness mechanism, domain-rule validity, duplicate + bucket-consistency checks
 │   ├── preprocessing.py      # cleaning + missingness flags + leak-safe split + imputation/encoding/scaling
-│   ├── model.py               # model construction
-│   ├── evaluate.py           # holdout metrics, cross-validation (week 4) + fairness check
+│   ├── model.py               # model construction (incl. oblique random forest and AdaBoost, week 6) + build_pipeline (preprocessing + model)
+│   ├── evaluate.py           # cross-validation (week 4), out-of-fold reports + fairness check
+│   ├── tuning.py             # hyperparameter tuning with Optuna + nested cross-validation (week 5)
 │   └── results.py            # saves each run's report to disk
 ├── experiments/
 │   ├── encoder_scaler_grid.py # week 3: picks encoder/scaler via an empirical grid (single splits, pre-CV)
@@ -189,6 +290,8 @@ This table is updated after each practical class, so you can always see what cha
 | 2 | Introduction & baseline pipeline | Initial version: project structure, a single naive train/test split (no cross-validation), minimal preprocessing (drop rows with missing values, one-hot encode categoricals), logistic regression baseline, a first (deliberately simple) fairness check comparing our model's and COMPAS's own false-positive rate by race, train-vs-test accuracy reporting (to start spotting overfitting), and each run's full report saved automatically to `results/` |
 | 3 | EDA diagnosis & leak-safe preprocessing | `src/data_diagnostics.py` (missingness mechanism test, domain-rule validity, placeholder detection, cross-column bucket-consistency check, duplicate check); `clean_dataset` replaces guesswork with the diagnosis's verdict table (placeholders/invalid values/inconsistent categories -> `NaN`, category spelling cleanup, exact-duplicate removal without blindly trusting repeated ids, redundant-column drop); `add_missing_flags` adds `_was_missing` indicators for MAR/MNAR columns; row-dropping replaced by median/mode imputation, fit only on the training fold; a configurable, leak-safe `ColumnTransformer` (`build_column_transformer`) replaces naive one-hot encoding, with the encoder/scaler pair picked via an empirical grid (`experiments/encoder_scaler_grid.py`) instead of a guess |
 | 4 | Holdout vs. cross-validation, locked test set | `dummy` and `random_forest` models; `make_pipeline`; `split_dev_test` replaces `split_train_test` (locked test set, `test_set` in the config); `drop_duplicate_rows` (training-only, before the split); sklearn's cross-fitting `TargetEncoder`; stratified k-fold CV of the whole pipeline (`cross_validate_pipeline`, `cv_report`, `oof_classification_report`, `cv` in the config) with out-of-fold reports; KNN imputer option; `experiments/compare_models.py`, `improve_pipeline.py` and `final_test.py`; limited-depth Random Forest chosen as the final model |
+| 5 | Hyperparameter tuning without leakage | New `src/tuning.py`: Optuna (seeded TPE) tunes the model on the development set only, every candidate scored by stratified 5-fold CV of the whole pipeline on the same folds (`tune_pipeline`); **nested cross-validation** (`nested_cross_validate`) gives the honest score of the tuned model, and its out-of-fold predictions feed the classification report and fairness check; `tuning_report` shows the best trial next to the nested score (optimism check); the final model is the tuned pipeline refit on all development rows; `build_pipeline()` in `src/model.py` replaces `make_pipeline`; `tuning` section in `config.yaml` (search spaces for decision tree, logistic regression, random forest); `optuna` in `requirements.txt`. The locked test set is still untouched |
+| 6 | Ensembles: random forest, oblique random forest, AdaBoost | Two new model types in `src/model.py`, registered in `_MODELS`: `oblique_random_forest` (a forest of trees that split on random linear combinations of the features, built from `SparseRandomProjection` + a decision tree inside `BaggingClassifier`) and `adaboost` (AdaBoost over decision trees of a chosen depth, stumps by default); the random forest is now the model `main.py` runs (200 trees); `config.yaml` gains search spaces for the three ensembles -- the forests tune tree size and decorrelation but not the number of trees (more trees never overfit), AdaBoost tunes its base trees' depth, number of rounds and learning rate; all five models compared with nested CV on the same folds; Challenge 1: `add_engineered_features()` in `src/preprocessing.py` (fixed-formula features, computed before the split), two sets tested with nested CV and left out of `numeric_features` because no model gained (see "Part 2 -- ensembles") |
 
 ## Environment setup
 
@@ -248,11 +351,13 @@ folder, on any OS:
 python main.py
 ```
 
-This loads `config.yaml`, loads and preprocesses the data, trains the model, and prints:
-- **train accuracy and test accuracy, side by side.** Comparing the two is how you catch overfitting: if the model looks much better on the data it was trained on than on data it's never seen, it has memorised rather than learned something that generalises. 
-- a classification report on the test set
+This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + model on the development set, tunes the hyperparameters if `tuning.enabled` is on, and prints:
+- **a per-fold cross-validation table** with the hyperparameters from `config.yaml` (not tuned): train and validation accuracy per fold, the gap between them, and their mean ± std. Comparing train and validation is how you catch overfitting: if the model looks much better on the data it was trained on than on data it's never seen, it has memorised rather than learned something that generalises.
+- with tuning on: the **nested cross-validation** table (the honest score of the tuned model, and the hyperparameters chosen in each outer fold) and the **tuning report** (best hyperparameters, top trials, optimism check)
+- a classification report on the out-of-fold predictions (from nested CV when tuning is on)
 - a false-positive-rate-by-race comparison between our model and
-  COMPAS's own score
+  COMPAS's own score (same rows)
+- the final model: the same (tuned) pipeline refit on all development rows. The locked test set is **not** evaluated.
 
 All of this is also saved to a timestamped file in `results/` (e.g.`results/run_20260916_143012.txt`), so it doesn't just scroll past in your terminal -- open it later, or change something in `config.yaml` (like the model type) and compare the new file to the last one.
 `results/` is created automatically the first time you run the

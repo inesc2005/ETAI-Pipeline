@@ -28,10 +28,10 @@ from sklearn.model_selection import StratifiedKFold
 
 from src.data import load_data
 from src.evaluate import cross_validate_pipeline
+from src.model import build_pipeline
 from src.preprocessing import (
     clean_dataset,
     drop_duplicate_rows,
-    make_pipeline,
     split_dev_test,
     split_features_target,
 )
@@ -107,7 +107,7 @@ def main():
     for name, model_config, overrides in VARIANTS:
         print(f"running {name} ...")
         prep = {**base_prep, **overrides}
-        fold_scores, _ = cross_validate_pipeline(make_pipeline(model_config, prep), X_dev, y_dev, cv, scoring)
+        fold_scores, _ = cross_validate_pipeline(build_pipeline(prep, model_config), X_dev, y_dev, cv, scoring)
         val = fold_scores["validation"].to_numpy()
         if baseline_folds is None:
             baseline_folds = val

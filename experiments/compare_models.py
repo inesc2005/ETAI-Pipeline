@@ -22,10 +22,10 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 
 from src.data import load_data
 from src.evaluate import cross_validate_pipeline
+from src.model import build_pipeline
 from src.preprocessing import (
     clean_dataset,
     drop_duplicate_rows,
-    make_pipeline,
     split_dev_test,
     split_features_target,
 )
@@ -60,7 +60,7 @@ def load_config(path: str = "config.yaml") -> dict:
 #one train/validation split (75/25, stratified); returns train and validation accuracy.
 def holdout_scores(model_config, preprocessing_config, X, y, seed):
     X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=HOLDOUT_SIZE, random_state=seed, stratify=y)
-    pipe = make_pipeline(model_config, preprocessing_config).fit(X_tr, y_tr)
+    pipe = build_pipeline(preprocessing_config, model_config).fit(X_tr, y_tr)
     return accuracy_score(y_tr, pipe.predict(X_tr)), accuracy_score(y_va, pipe.predict(X_va))
 
 
@@ -92,7 +92,7 @@ def main():
         val_all = [v for _, v in seeds]
 
         fold_scores, _ = cross_validate_pipeline(
-            make_pipeline(model_config, prep), X_dev, y_dev, cv, cv_config.get("scoring", "accuracy"),
+            build_pipeline(prep, model_config), X_dev, y_dev, cv, cv_config.get("scoring", "accuracy"),
         )
 
         w2, w3 = WEEK2.get(name), WEEK3.get(name)

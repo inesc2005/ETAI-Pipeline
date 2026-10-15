@@ -24,6 +24,9 @@ def cross_validate_pipeline(pipeline, X, y, cv, scoring: str = "accuracy", n_job
       - y_oof: out-of-fold predictions -- every row predicted by the fold model that did NOT
         train on it. The classification report and fairness check are computed on these.
     """
+    # 5 rounds: in each, a fresh copy of the pipeline trains on 4 folds and is scored on the 5th.
+    # The folds are the same for every model (fixed seed), so models are compared on equal terms.
+
     scores = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, return_train_score=True,
                             return_estimator=True, return_indices=True, n_jobs=n_jobs)
     fold_scores = pd.DataFrame({
@@ -58,6 +61,7 @@ def cv_report(fold_scores: pd.DataFrame, scoring: str = "accuracy") -> str:
 
 def oof_classification_report(y_true, y_pred) -> str:
     """Classification report on the out-of-fold predictions."""
+    # precision, recall and f1 per class, computed on the out-of-fold predictions of the dev set
     text = "Classification report (out-of-fold predictions, development set):\n" + \
         classification_report(y_true, y_pred, zero_division=0)
     print(text)
@@ -75,6 +79,8 @@ def fairness_report(y_true, y_pred, extras: pd.DataFrame, sensitive_attr: str = 
         - COMPAS's own risk score (score_text != "Low" counts as a "high risk" prediction), for comparison
     """
     df = extras.copy()
+    # people whose group is missing are reported as "unknown" instead of silently dropped by groupby
+    df[sensitive_attr] = df[sensitive_attr].astype(object).fillna("unknown")
     df["y_true"] = pd.Series(y_true).values
     df["y_pred_model"] = y_pred
     df["y_pred_compas"] = (df["score_text"] != "Low").astype(int)

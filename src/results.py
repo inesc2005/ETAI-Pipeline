@@ -19,6 +19,12 @@ def save_run(results_dir: str, config: dict, report_text: str) -> str:
     path = os.path.join(results_dir, f"run_{timestamp}.txt")
 
     cv = config["cv"]
+    tuning = config.get("tuning", {})
+    if tuning.get("enabled"):
+        tuning_line = (f"Optuna (TPE), {tuning['n_trials']} trials x {tuning['n_splits']} inner folds, "
+                       f"nested CV  random_state={tuning['random_state']}")
+    else:
+        tuning_line = "off"
     header = (
         f"Run: {timestamp}\n"
         f"Model: {config['model']['type']}  params={config['model'].get('params')}\n"
@@ -26,6 +32,7 @@ def save_run(results_dir: str, config: dict, report_text: str) -> str:
         f"scaler={config['preprocessing']['scaler']}\n"
         f"CV: {cv['n_splits']} stratified folds  shuffle={cv.get('shuffle', True)}  "
         f"random_state={cv.get('random_state')}  metric={cv.get('scoring', 'accuracy')}\n"
+        f"Tuning: {tuning_line}\n"
         f"Locked test set: size={config['test_set']['size']}  "
         f"random_state={config['test_set']['random_state']}  (not evaluated)\n"
         + "=" * 60 + "\n\n"
