@@ -1,116 +1,104 @@
-# Baseline pipeline configuration.
-# Nothing here is hardcoded in the source files below -- everything tunable lives in this one place.
+# Pipeline configuration: everything tunable lives here, nothing is hardcoded in src/.
 
 data:
   path: "data/compas_two_year_recidivism.csv"
   target: "two_year_recid"
-  sensitive_attr: "race"          # excluded from model features, used only to audit fairness
-  drop_columns: ["id", "decile_score", "score_text"]  # identifiers / COMPAS's own score, not our model's inputs
+  sensitive_attr: "race"          # never a feature; used only for the fairness check
+  drop_columns: ["id", "decile_score", "score_text"]  # id and COMPAS's own score, never model inputs
 
-# the FINAL TEST SET: carved out once, stratified, locked. Never used to fit, tune, compare or
-# choose anything. Do not change these values afterwards -- a new seed gives a different test set.
+# locked test set: never used to fit, tune or choose anything. Do not change once set.
 test_set:
   size: 0.2
   random_state: 42
 
-# how models are evaluated: stratified k-fold cross-validation on the development set
-# (everything except the locked test set). Same random_state = same folds on every run and
-# for every model, so comparisons are like-for-like.
+# stratified k-fold CV on the development set; same random_state = same folds for every run
 cv:
   n_splits: 5
   shuffle: true
   random_state: 42
-  scoring: "accuracy"
-  n_jobs: 1             # -1 = all cores (only pays off for slow models, e.g. random forest)
+  # reported for every run; fbeta_2 counts recall twice as much as precision
+  metrics: ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "fbeta_2", "roc_auc", "average_precision"]
+  selection_metric: "roc_auc"   # what tuning maximises and the scoreboard ranks runs by
+  n_jobs: 1                     # -1 = all CPU cores
 
 model:
-  # one of: "dummy", "logistic_regression", "decision_tree", "random_forest",
-  #         "oblique_random_forest", "adaboost" (the last two: week 6, built in src/model.py)
-  # Week 6: the random forest is the model main.py runs.
-  # `params` are the DEFAULT (untuned) hyperparameters; with tuning on, the search space below
-  # overrides the ones it covers.
-  type: "random_forest"
-  params:
-    n_estimators: 200       # more trees never overfit, they only cost time -- fixed, not tuned
+  # dummy | logistic_regression | naive_bayes | decision_tree | random_forest |
+  # oblique_random_forest | adaboost | gradient_boosting | hist_gradient_boosting
+  type: "gradient_boosting"
+  params:                       # default (untuned) hyperparameters
     random_state: 42
-    n_jobs: -1              # -1 = all CPU cores
-  # Other models' params, to swap in (default = sklearn defaults, for the "Default" column of the README):
-  # decision_tree:          {random_state: 42}
-  # logistic_regression:    {max_iter: 2000}
+  # Other models' params, to swap in (dummy: run it with tuning.enabled: false):
+  # dummy:                  {}
+  # logistic_regression:    {max_iter: 2000, class_weight: balanced}
+  # naive_bayes:            {}
+  # decision_tree:          {random_state: 42, class_weight: balanced}
+  # random_forest:          {n_estimators: 200, random_state: 42, n_jobs: -1, class_weight: balanced}
   # oblique_random_forest:  {n_estimators: 200, n_components: 10, random_state: 42, n_jobs: -1}
   # adaboost:               {max_depth: 1, n_estimators: 200, learning_rate: 1.0, random_state: 42}
-  # Week 4 hand-picked forest (experiments/improve_pipeline.py), now replaced by tuning:
-  # random_forest:          {n_estimators: 300, max_depth: 6, min_samples_leaf: 20, random_state: 42, n_jobs: -1}
+  # hist_gradient_boosting: {random_state: 42, class_weight: balanced}
 
-# Week 5: hyperparameter tuning with Optuna (src/tuning.py) -- development set only, every candidate
-# scored by CV of the whole pipeline, honest number from nested CV.
-# Cost: (cv.n_splits + 1) x n_trials x tuning.n_splits fits (5+1 x 30 x 5 = 900).
+# Optuna tuning on the development set; the honest score comes from nested CV
 tuning:
-  enabled: true          # false = exactly the week 4 pipeline
-  # 30 for the decision tree and logistic regression (the week 5 README rows). The week 5 random forest
-  # row was run with n_trials: 15 and the week 5 random forest search space (commented out below).
-  # Ensembles (week 6) take minutes per run: use a small n_trials (e.g. 5) while testing.
-  n_trials: 30
-  n_splits: 5            # inner folds that score each candidate
-  random_state: 42       # seeds the TPE sampler and the inner folds
-  # Keys are Pipeline parameter names (step__param). Types: int / float (low, high, log) or categorical (choices).
+  enabled: true
+  n_trials: 30                  # use ~5 while testing: ensembles take minutes per run
+  n_splits: 5                   # inner folds that score each candidate
+  random_state: 42
+  # keys are Pipeline parameter names; types: int / float (low, high, log) or categorical (choices)
   search_spaces:
     decision_tree:
       model__max_depth: {type: int, low: 1, high: 20}
       model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
       model__criterion: {type: categorical, choices: ["gini", "entropy"]}
     logistic_regression:
-      # C = inverse regularisation strength (smaller = stronger): log scale, so 0.001 gets as
-      # much attention as 10
       model__C: {type: float, low: 0.0001, high: 100, log: true}
-    # Week 6: the forests tune the size of the trees (max_depth, min_samples_leaf) and how different
-    # they are from each other (max_features / n_components), but NOT the number of trees: more trees
-    # never overfit, so n_estimators is fixed in `params`.
-    random_forest:
+    random_forest:              # n_estimators is fixed in params: more trees never overfit
       model__max_depth: {type: int, low: 2, high: 30}
       model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
-      model__max_features: {type: categorical, choices: ["sqrt", 0.5, 1.0]}   # 1.0 = all features (plain bagging)
+      model__max_features: {type: categorical, choices: ["sqrt", 0.5, 1.0]}
     oblique_random_forest:
-      # the parameters live inside BaggingClassifier ("estimator") -> the oblique tree Pipeline ("tree" / "project")
       model__estimator__tree__max_depth: {type: int, low: 2, high: 30}
       model__estimator__tree__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
-      model__estimator__project__n_components: {type: int, low: 3, high: 10}   # <= number of features
+      model__estimator__project__n_components: {type: int, low: 3, high: 10}
     adaboost:
-      # AdaBoost wants WEAK base trees, and its number of rounds can overfit, so both are tuned;
-      # n_estimators and learning_rate trade off against each other, so they are tuned together
       model__estimator__max_depth: {type: int, low: 1, high: 8}
       model__n_estimators: {type: int, low: 25, high: 400, log: true}
       model__learning_rate: {type: float, low: 0.01, high: 1.0, log: true}
-    # Week 5 random forest search space (it also tuned n_estimators), kept to reproduce the week 5 README row:
-    # random_forest:
-    #   model__n_estimators: {type: int, low: 50, high: 200}
-    #   model__max_depth: {type: categorical, choices: [3, 5, 8, 12, 20, null]}
-    #   model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
-    #   model__max_features: {type: categorical, choices: ["sqrt", "log2", 0.5, 1.0]}
+    gradient_boosting:
+      model__n_estimators: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_depth: {type: int, low: 1, high: 6}
+      model__min_samples_leaf: {type: int, low: 1, high: 200, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+    hist_gradient_boosting:
+      model__max_iter: {type: int, low: 25, high: 500, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.5, log: true}
+      model__max_leaf_nodes: {type: int, low: 2, high: 63, log: true}
+      model__min_samples_leaf: {type: int, low: 5, high: 200, log: true}
+      model__l2_regularization: {type: float, low: 0.000001, high: 10.0, log: true}
+    naive_bayes:
+      model__var_smoothing: {type: float, low: 0.000000000001, high: 0.1, log: true}
 
 output:
-  results_dir: "results"   # each run's full report is saved here as a timestamped .txt file
+  results_dir: "results"            # one full report per run
+  scoreboard: "results/runs.csv"    # one row per run; delete it if the data, cleaning or folds change
 
 diagnostics:
-  # columns used as predictors when testing whether a column's missingness
-  # is associated with anything else observable (chi-square + Cramer's V)
+  # predictors for the missingness-mechanism test (chi-square + Cramer's V)
   candidate_predictors: ["sex", "race", "age_cat", "c_charge_degree", "score_text"]
 
-  # domain rules: values outside these ranges are impossible, not just unusual --
-  # converted to NaN before anything downstream treats them as legitimate data
+  # impossible values -> NaN
   validity_rules:
     age: "18 <= age <= 100"
     decile_score: "1 <= decile_score <= 10"
     juv_fel_count: "juv_fel_count >= 0"
     priors_count: "0 <= priors_count <= 60"
 
-  # column used to check for repeated-record duplicates (in addition to exact-row duplicates)
-  id_column: "id"
+  id_column: "id"                   # repeated ids count as duplicates
 
-  # stand-in tokens for missing data that don't show up under .isna()
+  # stand-in tokens for missing data
   placeholder_tokens: ["-", "?", "n/a", "N/A", "na", "NA", ""]
 
-  # known spelling/casing variants, mapped to one canonical label per column
+  # spelling/casing variants -> one label per column
   canonical_maps:
     sex:
       male: "Male"
@@ -133,15 +121,10 @@ diagnostics:
       medium: "Medium"
       high: "High"
 
-  # perfectly (or near-perfectly) redundant columns, dropped after the multicollinearity check
+  # redundant columns (multicollinearity check)
   columns_to_drop: ["prior_offenses", "age_in_months", "juvenile_total"]
 
-  # cross-column consistency: a category label should match the bucket its own
-  # numeric source value falls into. Found by comparing age_cat against age and
-  # score_text against decile_score -- individually valid values that disagree
-  # with each other (e.g. age=55 but age_cat="Less than 25"). Mismatches get the
-  # category column set to NaN (the numeric source column is trusted, since it
-  # already passed validity_rules above).
+  # a category must match the bucket of its numeric source; mismatches -> category set to NaN
   bucket_consistency:
     age_cat:
       value_column: "age"
@@ -156,27 +139,14 @@ diagnostics:
         - {min: 5, max: 8, label: "Medium"}
         - {min: 8, max: 11, label: "High"}
 
-# imputation + encoding/scaling recipe, driven by the verdict table's per-column
-# missingness diagnosis (see diagnostics.candidate_predictors above)
 preprocessing:
   numeric_features: ["age", "juv_fel_count", "juv_misd_count", "juv_other_count", "priors_count"]
-  # Week 6 (Challenge 1): add_engineered_features() in src/preprocessing.py also computes
-  #   priors_per_adult_year, has_juvenile_record, priors_bin, felony_with_priors, log_priors
-  # A model only uses them if they are added to numeric_features above, e.g.
-  #   attempt 1: + ["priors_per_adult_year", "has_juvenile_record", "priors_bin"]
-  #   attempt 2: + ["priors_per_adult_year", "felony_with_priors", "log_priors"]   (preferred)
-  # Tested with nested CV (README, "Challenge 1"): no model gained by more than the fold std
-  # (logistic regression +0.001; random forest and AdaBoost slightly worse), so they are left out.
+  # engineered features (add to numeric_features to use them; tested, none helped -- see README):
+  # priors_per_adult_year, has_juvenile_record, priors_bin, felony_with_priors, log_priors
   categorical_features: ["sex", "age_cat", "c_charge_degree"]
-  # MAR/MNAR columns (per the verdict table) -- get a "<col>_was_missing" flag
-  # before imputation, so the model can still see the pattern
-  mnar_columns: ["priors_count", "c_charge_degree"]
-  numeric_impute_strategy: "median"   # "median", "mean", or "knn" (KNNImputer; scaled first)
+  mnar_columns: ["priors_count", "c_charge_degree"]   # get a "<col>_was_missing" flag
+  numeric_impute_strategy: "median"         # median | mean | knn
   categorical_impute_strategy: "most_frequent"
-  # winner of the encoder x scaler empirical grid (experiments/encoder_scaler_grid.py):
-  # "target" encoding beat onehot/ordinal/count consistently across 15 repeated splits;
-  # the scaler choice made no real difference (paired comparison came out as noise),
-  # so "standard" was kept as the conventional default
-  scaler: "standard"    # "standard", "minmax", "robust", or "none"
-  random_state: 42      # seed for the target encoder's internal cross-fitting
-  encoder: "target"      # "onehot", "ordinal", "count", or "target"
+  scaler: "standard"                        # standard | minmax | robust | none
+  random_state: 42                          # target encoder's internal folds
+  encoder: "target"                         # onehot | ordinal | count | target

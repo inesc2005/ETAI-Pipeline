@@ -7,11 +7,15 @@ Run with:
 This orchestrates the full pipeline:
     load config -> load data -> clean -> drop duplicate rows -> add engineered features -> add missingness flags
     -> split features/target -> set the final test set aside (locked)
-    -> stratified k-fold cross-validation of preprocessing + model on the development set
+    -> stratified k-fold cross-validation of preprocessing + model on the development set,
+       on several metrics, plus the no-model floor (a dummy) on the same folds
     -> [if tuning.enabled: nested CV of the tuning procedure, then tuning on all development rows]
-    -> out-of-fold classification report + fairness check
-    -> refit the final (tuned) model on the whole development set -> save results
+    -> out-of-fold confusion matrix, classification report + fairness check
+    -> refit the final (tuned) model on the whole development set
+    -> one row on the scoreboard (results/runs.csv) + the full report in results/
 """
+from datetime import datetime
+
 import optuna
 import yaml
 from sklearn.model_selection import StratifiedKFold
@@ -26,13 +30,14 @@ from src.preprocessing import (
 )
 from src.model import build_pipeline
 from src.evaluate import (
+    build_scorers,
     cross_validate_pipeline,
     cv_report,
     fairness_report,
     oof_classification_report,
 )
 from src.tuning import nested_cross_validate, tune_pipeline, tuning_report
-from src.results import save_run
+from src.results import save_run, save_scores
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -42,6 +47,8 @@ def load_config(path: str = "config.yaml") -> dict:
 
 def main():
     config = load_config()
+    run = datetime.now().strftime("%Y%m%d_%H%M%S")    # one id for this run: on the scoreboard and in the report's name
+    model_type = config["model"]["type"]
 
     df = load_data(config["data"]["path"])
     df_clean = clean_dataset(df, config["diagnostics"])
@@ -66,28 +73,43 @@ def main():
         random_state=config["test_set"]["random_state"],
     )
 
-    # preprocessing lives inside the pipeline, so CV re-fits it on the training part of every fold
-    pipeline = build_pipeline(config["preprocessing"], config["model"])
-
     # fixed random_state = the same folds for every model, so fold scores compare like-for-like
     cv_config = config["cv"]
     shuffle = cv_config.get("shuffle", True)
     cv = StratifiedKFold(n_splits=cv_config["n_splits"], shuffle=shuffle,
                          random_state=cv_config.get("random_state") if shuffle else None)
-    scoring = cv_config.get("scoring", "accuracy")
+    # week 7: several metrics are reported, ONE (the selection metric) is optimised and ranks the runs
+    metrics = cv_config["metrics"]
+    selection_metric = cv_config["selection_metric"]
+    scorers = build_scorers(metrics)
     n_jobs = cv_config.get("n_jobs", 1)
+    print(f"Model: {model_type}   |   selection metric: {selection_metric}   |   {cv_config['n_splits']}-fold CV")
+    print(f"Data:  {len(X_dev)} development rows   |   {len(X_test)} test rows locked away (not used)")
 
-    # 1. the model with the hyperparameters written in config.yaml (no tuning) -- the "default" row
-    fold_scores, y_oof = cross_validate_pipeline(pipeline, X_dev, y_dev, cv, scoring, n_jobs=n_jobs)
-    header = f"Hyperparameters from config.yaml (not tuned): {config['model'].get('params')}"
-    print(header)
-    report = header + "\n" + cv_report(fold_scores, scoring)
+    # preprocessing lives inside the pipeline, so CV re-fits it on the training part of every fold
+    pipeline = build_pipeline(config["preprocessing"], config["model"])
 
-    # 2.  hyperparameter tuning -- development set only, every candidate scored by CV of the whole pipeline (see src/tuning.py)
+    # the no-model floor: a dummy on the same folds -- what any real model has to beat
+    floor_pipeline = build_pipeline(config["preprocessing"], {"type": "dummy"})
+    floor_scores, _ = cross_validate_pipeline(floor_pipeline, X_dev, y_dev, cv,
+                                              {selection_metric: scorers[selection_metric]}, selection_metric, n_jobs)
+    floor = floor_scores["validation"].mean()
+
+    # the model with the hyperparameters written in config.yaml (no tuning) -- the "untuned" score
+    fold_scores, oof_proba = cross_validate_pipeline(pipeline, X_dev, y_dev, cv, scorers, selection_metric, n_jobs)
+    untuned = fold_scores["validation"].mean()
+    print("\nDefault hyperparameters (config.yaml)")
+    print(f"  {selection_metric}: {untuned:.3f} ± {fold_scores['validation'].std(ddof=1):.3f}   "
+          f"train-validation gap: {fold_scores['gap'].mean():+.3f}   no-model floor: {floor:.3f}")
+    report = (f"Hyperparameters from config.yaml (not tuned): {config['model'].get('params')}\n\n"
+              + cv_report(fold_scores, metrics, selection_metric, "Cross-validation")
+              + f"\n\nNo-model floor (dummy, same folds): {selection_metric} = {floor:.3f}")
+    final_scores = fold_scores   # replaced by the nested CV scores when tuning is on
+
+    #  hyperparameter tuning -- development set only, every candidate scored by CV of the whole pipeline on the selection metric (see src/tuning.py)
     tuning_config = config.get("tuning", {})
     tuning_enabled = tuning_config.get("enabled", False)
     if tuning_enabled:
-        model_type = config["model"]["type"]
         search_spaces = tuning_config.get("search_spaces") or {}
         if model_type not in search_spaces:
             raise ValueError(f"tuning.enabled is true but config.yaml has no tuning.search_spaces for "
@@ -99,40 +121,62 @@ def main():
         optuna.logging.set_verbosity(optuna.logging.WARNING)   # no line per trial
 
         # the honest estimate: tuning repeated inside each outer fold (the same folds as above),
-        # scored on rows it never saw. Its out-of-fold predictions replace the untuned ones in
-        # the classification and fairness reports below.
-        print(f"\nNested cross-validation: {cv.get_n_splits()} outer folds x {n_trials} trials x "
-              f"{inner_cv.get_n_splits()} inner folds ...")
-        nested_scores, y_oof = nested_cross_validate(
-            pipeline, X_dev, y_dev, cv, inner_cv, scoring, search_space, n_trials, tuning_seed, n_jobs=n_jobs
+        # scored on rows it never saw. Its out-of-fold probabilities replace the untuned ones in
+        # the reports below.
+        print(f"\nTuning ({n_trials} trials, nested CV) ... this takes a while", flush=True)
+        final_scores, oof_proba = nested_cross_validate(
+            pipeline, X_dev, y_dev, cv, inner_cv, scorers, selection_metric,
+            search_space, n_trials, tuning_seed, n_jobs=n_jobs,
         )
-        report += "\n\nNested cross-validation (tuned model, honest estimate):\n" + cv_report(nested_scores, scoring)
+        print(f"  {selection_metric}: {final_scores['validation'].mean():.3f} ± "
+              f"{final_scores['validation'].std(ddof=1):.3f}   (honest estimate of the tuned model)")
+        report += "\n\n" + cv_report(final_scores, metrics, selection_metric,
+                                     "Nested cross-validation (tuned model, honest estimate)")
 
         # the hyperparameters we keep: the same procedure, once, on all development rows
-        print()
-        pipeline, study = tune_pipeline(
-            pipeline, X_dev, y_dev, inner_cv, scoring, search_space, n_trials, tuning_seed, n_jobs=n_jobs
-        )
-        report += "\n\n" + tuning_report(study, nested_scores, scoring)
+        pipeline, study = tune_pipeline(pipeline, X_dev, y_dev, inner_cv, scorers[selection_metric],
+                                        search_space, n_trials, tuning_seed, n_jobs=n_jobs)
+        print("  Chosen hyperparameters:")
+        for name, value in study.best_params.items():
+            print(f"    {name.replace('model__', ''):<22s} {value:.4g}" if isinstance(value, float)
+                  else f"    {name.replace('model__', ''):<22s} {value}")
+        report += "\n\n" + tuning_report(study, final_scores, selection_metric)
 
-    report += "\n\n" + oof_classification_report(y_dev, y_oof)
-    report += "\n" + fairness_report(
-        y_dev, y_oof, extras_dev, sensitive_attr=config["data"]["sensitive_attr"]
-    )
+    print(f"\nAll metrics ({'tuned model, nested CV' if tuning_enabled else 'default hyperparameters'}, mean ± std)")
+    for name in metrics:
+        print(f"  {name:<18s} {final_scores[name].mean():.3f} ± {final_scores[name].std(ddof=1):.3f}")
+    report += "\n\n" + oof_classification_report(y_dev, oof_proba)
+    report += "\n" + fairness_report(y_dev, oof_proba, extras_dev, sensitive_attr=config["data"]["sensitive_attr"])
 
     # the model we'd actually use: same (tuned) pipeline refit on EVERY development row.
     # CV estimated how well this recipe does; it didn't produce a model.
     pipeline.fit(X_dev, y_dev)
-    footer = f"Final model: {config['model']['type']} refit on all {len(X_dev)} development rows."
+    footer = f"Final model: {model_type} refit on all {len(X_dev)} development rows."
     if tuning_enabled:
         footer += f"\nTuned hyperparameters: {study.best_params}"
     footer += f"\nLocked test set: {len(X_test)} rows set aside, not evaluated."
-    print(footer)
     report += "\n" + footer + "\n"
 
-    results_dir = config.get("output", {}).get("results_dir", "results")
-    path = save_run(results_dir, config, report)
-    print(f"Full results saved to {path}")
+    # week 7: the scoreboard: one row per run, with the score on each fold, so any two runs on the same data and folds can be compared with corrected_paired_test()
+    row = {"run": run, "data": config["data"]["path"], "model": model_type, "tuned": tuning_enabled,
+           "encoder": config["preprocessing"]["encoder"], "scaler": config["preprocessing"]["scaler"],
+           "params": str(config["model"].get("params")),
+           "tuned_params": str(study.best_params) if tuning_enabled else "",
+           "metric": selection_metric, "mean": final_scores["validation"].mean(),
+           "std": final_scores["validation"].std(ddof=1), "untuned": untuned, "floor": floor,
+           **{f"fold_{i}": score for i, score in enumerate(final_scores["validation"], start=1)}}
+    output = config.get("output", {})
+    runs = save_scores(output.get("scoreboard", "results/runs.csv"), row)
+    same = runs[(runs["data"] == row["data"]) & (runs["metric"] == selection_metric)]   # only comparable runs
+    board = (same.sort_values("mean", ascending=False)
+             [["run", "model", "tuned", "mean", "std", "untuned", "floor"]]
+             .rename(columns={"mean": selection_metric})
+             .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(f"\nScoreboard (runs on the same data and metric, best first)\n{board}")
+    report += f"\nScoreboard:\n{board}\n"
+
+    path = save_run(output.get("results_dir", "results"), run, config, report)
+    print(f"\n{footer}\nFull report (per-fold tables, tuning, confusion matrix, fairness): {path}")
 
 
 if __name__ == "__main__":

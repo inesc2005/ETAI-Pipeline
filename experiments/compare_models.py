@@ -21,7 +21,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 from src.data import load_data
-from src.evaluate import cross_validate_pipeline
+from src.evaluate import build_scorers, cross_validate_pipeline
 from src.model import build_pipeline
 from src.preprocessing import (
     clean_dataset,
@@ -92,8 +92,8 @@ def main():
         val_all = [v for _, v in seeds]
 
         fold_scores, _ = cross_validate_pipeline(
-            build_pipeline(prep, model_config), X_dev, y_dev, cv, cv_config.get("scoring", "accuracy"),
-        )
+            build_pipeline(prep, model_config), X_dev, y_dev, cv, build_scorers(["accuracy"]), "accuracy",
+        )   # week 4 tables: accuracy (week 7 changed the function to take scorers)
 
         w2, w3 = WEEK2.get(name), WEEK3.get(name)
         table1.append({

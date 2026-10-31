@@ -1,14 +1,84 @@
-**Name: Inês Calado**
+**Name: Inês Calado**  
 **Student Number: 20260537**
 
-## Week 5 e 6 -- hyperparameter tuning, and ensembles
+## Week 7 -- gradient boosting, and evaluating with probabilities
+
+The goal: add the boosting models, and judge every model on several metrics instead of just accuracy, with a scoreboard that tracks all runs for comparison.
+
+### What was added, and where
+
+- **`src/model.py`**: three new model types in `_MODELS`, straight from scikit-learn (no builder function needed): `gradient_boosting` (`GradientBoostingClassifier`: shallow regression trees added one at a time, each one fitted to the gradient of the log-loss left by the previous ones), `hist_gradient_boosting` (`HistGradientBoostingClassifier`: the same algorithm on binned features, faster on large data and able to handle missing values) and `naive_bayes` (`GaussianNB`, a fast probabilistic baseline).
+- **`config.yaml`**
+  - `model` is now gradient boosting (`random_state: 42`); the other models' default `params` are comments, with `class_weight: balanced` for the models that support it.
+  - Search spaces for the three new models. For the boosters, the number of trees, the learning rate and the tree size are searched together, because they trade off against each other 
+  - In `cv`, `scoring: "accuracy"` is replaced by `metrics` (8 metrics: accuracy, balanced accuracy, precision, recall, F1, F-beta 2, ROC-AUC, average precision) and `selection_metric: "roc_auc"`.
+  - `output.scoreboard: "results/runs.csv"`.
+- **`src/evaluate.py`**
+  - new `build_scorers()`: one scorer per metric (`fbeta_2` is built with `make_scorer`, beta = 2).
+  - `cross_validate_pipeline()` scores every metric and returns out-of-fold probabilities; `cv_report()` shows the mean and std of every metric.
+  - `oof_classification_report()` and `fairness_report()` take the probabilities and a threshold (0.5); the classification report now includes the confusion matrix.
+  - `corrected_paired_test()` (from week 6, which I had not added yet): the corrected paired t-test (Nadeau & Bengio) to compare two models scored on the same folds. `scipy` is now listed in `requirements.txt` (it already came with scikit-learn).
+- **`src/tuning.py`** : `tune_pipeline()` takes the selection metric's scorer; `nested_cross_validate()` scores every metric on each outer fold and returns probabilities; `tuning_report()` uses the selection metric.
+- **`src/results.py`** new `save_scores()`: every run adds one row to `results/runs.csv` (model, settings, the selection metric's mean, std and score on each fold, the untuned score and the no-model floor - dummy model). `save_run()` names the report with the same run id and lists the metrics in its header.
+- **`main.py`** : builds the scorers once; scores the no-model floor (a dummy) on the same folds; prints a short summary (all metrics, chosen hyperparameters) while the full tables go to the results file; saves the run on the scoreboard and prints it.
+- `experiments/compare_models.py` and `improve_pipeline.py` were adapted to the new `cross_validate_pipeline()` and still use accuracy (they reproduce the week 4 tables).
+
+### Selection metric
+
+I use ROC-AUC as the selection metric. COMPAS is a risk score used to rank people, and ROC-AUC measures exactly that: the probability that a random person who reoffended gets a higher score than a random person who did not, over every threshold at once, so the choice of the yes/no threshold stays a separate decision. It is also less noisy than accuracy, which only counts on which side of 0.5 each person falls: on the same week 5/6 folds, `corrected_paired_test()` gives p = 0.43 for random forest vs. decision tree on accuracy (no verdict; full output in `results/accuracy_vs_rocauc_corrected_test.txt`), while on ROC-AUC this week the equivalent comparison (gradient boosting vs. decision tree, below) gives p = 0.01.
+
+### Scoreboard
+
+`python main.py` once per model, tuned with nested CV (30 trials, 5 inner folds, the same 5 outer folds for every model; the dummy has nothing to tune). 
+Untuned = the model with its default `params` from `config.yaml`; 
+floor = the dummy on the same folds. Source: `results/runs.csv`.
+
+| Model | Untuned ROC-AUC | Tuned: nested CV ROC-AUC (mean ± std) | Floor | Chosen hyperparameters |
+|---|---|---|---|---|
+| Gradient boosting | 0.727 | 0.728 ± 0.015 | 0.500 | `n_estimators=208`, `learning_rate=0.012`, `max_depth=4`, `min_samples_leaf=1`, `subsample=0.55` |
+| HistGradientBoosting | 0.717 | 0.728 ± 0.015 | 0.500 | `max_iter=302`, `learning_rate=0.014`, `max_leaf_nodes=10`, `min_samples_leaf=62`, `l2_regularization=0.0003` |
+| Oblique random forest | 0.685 | 0.727 ± 0.015 | 0.500 | `max_depth=13`, `min_samples_leaf=151`, `n_components=10` |
+| Random forest | 0.682 | 0.726 ± 0.014 | 0.500 | `max_depth=7`, `min_samples_leaf=3`, `max_features=sqrt` |
+| AdaBoost | 0.723 | 0.726 ± 0.016 | 0.500 | `max_depth=4`, `n_estimators=55`, `learning_rate=0.167` |
+| Logistic regression | 0.719 | 0.718 ± 0.014 | 0.500 | `C=0.44` |
+| Decision tree | 0.607 | 0.718 ± 0.016 | 0.500 | `max_depth=6`, `min_samples_leaf=104`, `criterion=gini` |
+| Naive Bayes | 0.685 | 0.703 ± 0.011 | 0.500 | `var_smoothing=0.091` |
+| Dummy (floor) | 0.500 | -- | 0.500 | -- |
+
+Defaults: logistic regression, decision tree, random forest and HistGradientBoosting with `class_weight: balanced`; gradient boosting, AdaBoost, oblique random forest and Naive Bayes have no `class_weight` here.
+
+The best model against each of the others (corrected paired t-test on the 5 outer folds, ROC-AUC:
+
+| Gradient boosting against | Mean difference | Folds won | p-value |
+|---|---|---|---|
+| HistGradientBoosting | +0.000 | 4/5 | 0.27 |
+| Oblique random forest | +0.001 | 4/5 | 0.76 |
+| Random forest | +0.002 | 4/5 | 0.48 |
+| AdaBoost | +0.002 | 3/5 | 0.49 |
+| Logistic regression | +0.010 | 5/5 | 0.08 |
+| Decision tree | +0.010 | 5/5 | 0.01 |
+| Naive Bayes | +0.025 | 5/5 | 0.01 |
+
+Every model is far above the floor (0.500). The five tree ensembles (both boosters, both forests and AdaBoost) score almost the same, 0.726-0.728, and the p-values for comparing them (0.27-0.76) are too high to call a winner: their small differences are not reliable enough to trust. Against the single decision tree and Naive Bayes, the best ensemble does show a real, trustworthy lead (p = 0.01). Against logistic regression it is probably also better (it wins in all 5 folds), but the lead is not quite reliable enough to be sure (p = 0.08, just above the usual 0.05 cut-off). Tuning helped most where the defaults overfit (decision tree 0.607 -> 0.718, the two forests about +0.04, also table above), and changed almost nothing for gradient boosting, AdaBoost and logistic regression, which were already well regularised.
+
+ROC-AUC says nothing about the 0.5 yes/no cut-off; for gradient boosting, at that threshold (nested CV):
+
+| Accuracy | Precision | Recall |
+|---|---|---|
+| 0.683 | 0.680 | 0.560 |
+
+With a recall of only 0.560, it misses about 44% of the people who actually reoffended, a consequence of using 0.5 as the cut-off. ROC-AUC never picks that cut-off, it only judges the ranking, so choosing (and justifying) a threshold is left as a separate decision.
+
+---
+
+## Week 5 and 6 -- hyperparameter tuning, and ensembles
 
 ## Part 1 -- continuing week 4: hyperparameter tuning without leakage
 
 The goal: compare each model with its **default** hyperparameters against the **tuned** version, with an honest number for the tuned one.
 
 ### What was added, and where
-
+ 
 - **`src/tuning.py`** (new)
   - `tune_pipeline` -- an Optuna study (seeded TPE sampler). Each trial reads its ranges from the search space in `config.yaml`, sets the values on a fresh, unfitted copy of the whole pipeline (`clone` + `set_params`) and scores it by its mean CV accuracy. Returns the best pipeline (unfitted) and the study.
   - `nested_cross_validate` -- the honest estimate of "tune, then refit": for each outer fold, the tuning runs on the outer-training rows only and the winner is scored on the outer-validation rows, which took no part in choosing it. Same output format as `cross_validate_pipeline`, plus `inner_best` (the tuning score inside that fold) and the hyperparameters chosen.
@@ -267,15 +337,15 @@ go on.
 │   ├── data_diagnostics.py   # missingness mechanism, domain-rule validity, duplicate + bucket-consistency checks
 │   ├── preprocessing.py      # cleaning + missingness flags + leak-safe split + imputation/encoding/scaling
 │   ├── model.py               # model construction (incl. oblique random forest and AdaBoost, week 6) + build_pipeline (preprocessing + model)
-│   ├── evaluate.py           # cross-validation (week 4), out-of-fold reports + fairness check
+│   ├── evaluate.py           # cross-validation (week 4), out-of-fold reports + fairness check, several metrics from out-of-fold probabilities + corrected paired test (week 7)
 │   ├── tuning.py             # hyperparameter tuning with Optuna + nested cross-validation (week 5)
-│   └── results.py            # saves each run's report to disk
+│   └── results.py            # saves each run's report to disk, and its scores to the scoreboard results/runs.csv (week 7)
 ├── experiments/
 │   ├── encoder_scaler_grid.py # week 3: picks encoder/scaler via an empirical grid (single splits, pre-CV)
 │   ├── compare_models.py     # week 4: 4 models, week 3 vs. now + holdout vs. CV tables
 │   ├── improve_pipeline.py   # week 4: one change at a time, compared with the same CV folds
 │   └── final_test.py         # week 4: one-off assessment on the locked test set
-├── results/                # created automatically -- one file per run (not tracked in git)
+├── results/                # created automatically -- one report per run + runs.csv, the scoreboard of all runs (not tracked in git)
 └── data/
     ├── compas_two_year_recidivism.csv
     └── README.md            # problem description + full data dictionary
@@ -292,6 +362,7 @@ This table is updated after each practical class, so you can always see what cha
 | 4 | Holdout vs. cross-validation, locked test set | `dummy` and `random_forest` models; `make_pipeline`; `split_dev_test` replaces `split_train_test` (locked test set, `test_set` in the config); `drop_duplicate_rows` (training-only, before the split); sklearn's cross-fitting `TargetEncoder`; stratified k-fold CV of the whole pipeline (`cross_validate_pipeline`, `cv_report`, `oof_classification_report`, `cv` in the config) with out-of-fold reports; KNN imputer option; `experiments/compare_models.py`, `improve_pipeline.py` and `final_test.py`; limited-depth Random Forest chosen as the final model |
 | 5 | Hyperparameter tuning without leakage | New `src/tuning.py`: Optuna (seeded TPE) tunes the model on the development set only, every candidate scored by stratified 5-fold CV of the whole pipeline on the same folds (`tune_pipeline`); **nested cross-validation** (`nested_cross_validate`) gives the honest score of the tuned model, and its out-of-fold predictions feed the classification report and fairness check; `tuning_report` shows the best trial next to the nested score (optimism check); the final model is the tuned pipeline refit on all development rows; `build_pipeline()` in `src/model.py` replaces `make_pipeline`; `tuning` section in `config.yaml` (search spaces for decision tree, logistic regression, random forest); `optuna` in `requirements.txt`. The locked test set is still untouched |
 | 6 | Ensembles: random forest, oblique random forest, AdaBoost | Two new model types in `src/model.py`, registered in `_MODELS`: `oblique_random_forest` (a forest of trees that split on random linear combinations of the features, built from `SparseRandomProjection` + a decision tree inside `BaggingClassifier`) and `adaboost` (AdaBoost over decision trees of a chosen depth, stumps by default); the random forest is now the model `main.py` runs (200 trees); `config.yaml` gains search spaces for the three ensembles -- the forests tune tree size and decorrelation but not the number of trees (more trees never overfit), AdaBoost tunes its base trees' depth, number of rounds and learning rate; all five models compared with nested CV on the same folds; Challenge 1: `add_engineered_features()` in `src/preprocessing.py` (fixed-formula features, computed before the split), two sets tested with nested CV and left out of `numeric_features` because no model gained (see "Part 2 -- ensembles") |
+| 7 | Gradient boosting + evaluating with probabilities | Three new model types in `src/model.py`: `gradient_boosting`, `hist_gradient_boosting` and `naive_bayes`, with search spaces in `config.yaml` (gradient boosting is now the model `main.py` runs); evaluation reports **8 metrics** from out-of-fold **probabilities** (`cv.metrics`) and one **selection metric** (`cv.selection_metric`, ROC-AUC) that tuning maximises and runs are ranked by (`build_scorers()`, new `cross_validate_pipeline()`, `cv_report()`, tuning functions); the classification report adds the confusion matrix; `corrected_paired_test()` compares two models on the same folds (`scipy` in `requirements.txt`); new `save_scores()`: every run adds a row to the **scoreboard** `results/runs.csv` (score on each fold, untuned score, no-model floor); all 9 models run and compared (see "Week 7") |
 
 ## Environment setup
 
@@ -351,15 +422,16 @@ folder, on any OS:
 python main.py
 ```
 
-This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + model on the development set, tunes the hyperparameters if `tuning.enabled` is on, and prints:
-- **a per-fold cross-validation table** with the hyperparameters from `config.yaml` (not tuned): train and validation accuracy per fold, the gap between them, and their mean ± std. Comparing train and validation is how you catch overfitting: if the model looks much better on the data it was trained on than on data it's never seen, it has memorised rather than learned something that generalises.
-- with tuning on: the **nested cross-validation** table (the honest score of the tuned model, and the hyperparameters chosen in each outer fold) and the **tuning report** (best hyperparameters, top trials, optimism check)
-- a classification report on the out-of-fold predictions (from nested CV when tuning is on)
-- a false-positive-rate-by-race comparison between our model and
-  COMPAS's own score (same rows)
+This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + model on the development set on several metrics (with the no-model floor on the same folds), tunes the hyperparameters if `tuning.enabled` is on, and prints a short summary:
+- the **selection metric** (`cv.selection_metric`, ROC-AUC) with the hyperparameters from `config.yaml` (not tuned): mean ± std, the train-validation gap (a large gap = overfitting: the model looks much better on the data it was trained on than on data it has never seen) and the no-model floor;
+- with tuning on: the honest score of the tuned model (nested cross-validation) and the hyperparameters chosen;
+- the mean ± std of **every metric** in `cv.metrics`;
+- the **scoreboard**: every run saved in `results/runs.csv` on the same data and metric, best first;
 - the final model: the same (tuned) pipeline refit on all development rows. The locked test set is **not** evaluated.
 
-All of this is also saved to a timestamped file in `results/` (e.g.`results/run_20260916_143012.txt`), so it doesn't just scroll past in your terminal -- open it later, or change something in `config.yaml` (like the model type) and compare the new file to the last one.
+The full tables go to the results file: the per-fold tables, the tuning report (top trials, optimism check), the out-of-fold confusion matrix and classification report, and the false-positive-rate-by-race comparison between our model and COMPAS's own score (same rows).
+
+All of this is saved to a file named after the run in `results/` (e.g. `results/run_20261031_144610.txt`), and one row per run goes to `results/runs.csv`, so it doesn't just scroll past in your terminal -- open it later, or change something in `config.yaml` (like the model type) and compare the new file to the last one.
 `results/` is created automatically the first time you run the
 pipeline, and isn't tracked in git (see `.gitignore`) since it's
 generated output, not source.

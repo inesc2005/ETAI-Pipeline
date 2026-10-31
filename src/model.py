@@ -1,7 +1,11 @@
 """Model construction: the model alone (`build_model`) and preprocessing + model (`build_pipeline`)."""
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import AdaBoostClassifier, BaggingClassifier, RandomForestClassifier
+from sklearn.ensemble import (
+    AdaBoostClassifier, BaggingClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
 from sklearn.pipeline import Pipeline
 from sklearn.random_projection import SparseRandomProjection
 from sklearn.tree import DecisionTreeClassifier
@@ -42,7 +46,10 @@ _MODELS = {
     "decision_tree": DecisionTreeClassifier,
     "random_forest": RandomForestClassifier,
     "oblique_random_forest": oblique_random_forest,   
-    "adaboost": adaboost,                             
+    "adaboost": adaboost,
+    "gradient_boosting": GradientBoostingClassifier,           # each shallow tree fits the gradient of the log-loss left by the previous ones
+    "hist_gradient_boosting": HistGradientBoostingClassifier,  # the same of gradient boosting but with binned features: faster, handles missing values
+    "naive_bayes": GaussianNB,                                 # fast probabilistic baseline
 }
 
 

@@ -27,7 +27,7 @@ import yaml
 from sklearn.model_selection import StratifiedKFold
 
 from src.data import load_data
-from src.evaluate import cross_validate_pipeline
+from src.evaluate import build_scorers, cross_validate_pipeline
 from src.model import build_pipeline
 from src.preprocessing import (
     clean_dataset,
@@ -101,13 +101,14 @@ def main():
     cv_config = config["cv"]
     cv = StratifiedKFold(n_splits=cv_config["n_splits"], shuffle=cv_config.get("shuffle", True),
                          random_state=cv_config.get("random_state"))
-    scoring = cv_config.get("scoring", "accuracy")
+    scoring = "accuracy"                    # week 4 tables: accuracy (week 7 replaced cv.scoring)
 
     rows, baseline_folds = [], None
     for name, model_config, overrides in VARIANTS:
         print(f"running {name} ...")
         prep = {**base_prep, **overrides}
-        fold_scores, _ = cross_validate_pipeline(build_pipeline(prep, model_config), X_dev, y_dev, cv, scoring)
+        fold_scores, _ = cross_validate_pipeline(build_pipeline(prep, model_config), X_dev, y_dev, cv,
+                                                 build_scorers([scoring]), scoring)
         val = fold_scores["validation"].to_numpy()
         if baseline_folds is None:
             baseline_folds = val

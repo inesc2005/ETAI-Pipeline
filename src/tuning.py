@@ -10,7 +10,6 @@ import numpy as np
 import optuna
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import get_scorer
 from sklearn.model_selection import cross_val_score
 
 
@@ -36,12 +35,13 @@ def _suggest_params(trial, search_space: dict) -> dict:
     return params
 
 
-def tune_pipeline(pipeline, X, y, cv, scoring: str, search_space: dict, n_trials: int,
+def tune_pipeline(pipeline, X, y, cv, scorer, search_space: dict, n_trials: int,
                   random_state: int, n_jobs: int = 1):
     """
-    Runs an Optuna study (TPE sampler, seeded) on (X, y). 
+    Runs an Optuna study (TPE sampler, seeded) on (X, y).
     Each trial draws a candidate from `search_space`, sets it on a fresh, unfitted copy of `pipeline`.
-    Scores it by its mean CV score over `cv` (the same folds for every trial)
+    Scores it by its mean CV score over `cv` (the same folds for every trial), with `scorer`:
+    the selection metric's scorer (week 7: e.g. ROC-AUC, no longer always accuracy).
 
     The mean is over the fold SCORES of that trial. 
     After all `n_trials` trials nothing is averaged either: the winner is the trial with the highest mean score.
@@ -56,7 +56,7 @@ def tune_pipeline(pipeline, X, y, cv, scoring: str, search_space: dict, n_trials
         candidate = clone(pipeline).set_params(**params)
 
         # score the candidate by CV of the WHOLE pipeline. Returns one score per fold.
-        scores = cross_val_score(candidate, X, y, cv=cv, scoring=scoring, n_jobs=n_jobs)
+        scores = cross_val_score(candidate, X, y, cv=cv, scoring=scorer, n_jobs=n_jobs)
         trial.set_user_attr("std", float(scores.std(ddof=1)))
 
         return scores.mean() #returns the mean score CV
@@ -74,8 +74,8 @@ def tune_pipeline(pipeline, X, y, cv, scoring: str, search_space: dict, n_trials
     return best_pipeline, study
 
 
-def nested_cross_validate(pipeline, X, y, outer_cv, inner_cv, scoring: str, search_space: dict,
-                          n_trials: int, random_state: int, n_jobs: int = 1):
+def nested_cross_validate(pipeline, X, y, outer_cv, inner_cv, scorers: dict, selection_metric: str,
+                          search_space: dict, n_trials: int, random_state: int, n_jobs: int = 1):
     """
     "How good is the best hyperparameter choice?" The honest answer comes from nested CV: the inner loop chooses, the outer loop judges.
     The data is split into folds (`outer_cv`, 5 in config.yaml). For each fold:
@@ -88,45 +88,48 @@ def nested_cross_validate(pipeline, X, y, outer_cv, inner_cv, scoring: str, sear
       5. the fold's scores, what the tuner believed (`inner_best`: the winner's score during the
          tuning, i.e. `study.best_value`), the hyperparameters chosen and the predictions are saved.
     In short, in every round: tune with 4 folds, evaluate on the 5th. The inner loop chooses, the
-    outer loop judges. Each outer fold may pick different hyperparameters 
+    outer loop judges. Each outer fold may pick different hyperparameters
 
+    Week 7: the tuning maximises `selection_metric`; every metric in `scorers` is then scored on
+    the fold that was set aside. Returns (fold_scores, oof_proba) in the same format as
+    `cross_validate_pipeline`, plus `inner_best` and the hyperparameters chosen in each fold.
     """
-    scorer = get_scorer(scoring)
+    selection_scorer = scorers[selection_metric]
     rows = []
-    y_oof = np.empty(len(X), dtype=np.asarray(y).dtype)
+    oof_proba = np.empty(len(X))
 
     for fold, (train_idx, val_idx) in enumerate(outer_cv.split(X, y), start=1):
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
 
-        best_pipeline, study = tune_pipeline(pipeline, X_train, y_train, inner_cv, scoring,
+        best_pipeline, study = tune_pipeline(pipeline, X_train, y_train, inner_cv, selection_scorer,
                                              search_space, n_trials, random_state, n_jobs)
         best_pipeline.fit(X_train, y_train)
 
-        train_score = scorer(best_pipeline, X_train, y_train)
-        val_score = scorer(best_pipeline, X_val, y_val)
-        y_oof[val_idx] = best_pipeline.predict(X_val)
-        rows.append({"fold": fold, "train": train_score, "validation": val_score,
-                     "gap": train_score - val_score, "inner_best": study.best_value,
-                     **study.best_params})
+        train_score = selection_scorer(best_pipeline, X_train, y_train)
+        val_scores = {name: scorer(best_pipeline, X_val, y_val) for name, scorer in scorers.items()}
+        oof_proba[val_idx] = best_pipeline.predict_proba(X_val)[:, 1]   # probability of reoffending
+        rows.append({"fold": fold, "train": train_score, "validation": val_scores[selection_metric],
+                     "gap": train_score - val_scores[selection_metric], **val_scores,
+                     "inner_best": study.best_value, **study.best_params})
 
-    return pd.DataFrame(rows), y_oof
+    return pd.DataFrame(rows), oof_proba
 
 
-def tuning_report(study, nested_scores: pd.DataFrame, scoring: str = "accuracy", top: int = 5) -> str:
+def tuning_report(study, nested_scores: pd.DataFrame, selection_metric: str, top: int = 5) -> str:
     """
     The final study (best hyperparameters, top trials) plus the optimism check: the mean tuning
-    score inside the outer folds vs. the mean honest score on them. As text (printed and returned).
+    score inside the outer folds vs. the mean honest score on them. As text (saved to results/).
     """
     trials = study.trials_dataframe(attrs=("number", "value", "params", "user_attrs"))
     trials = trials.rename(columns=lambda c: c.replace("params_", "").replace("user_attrs_", ""))
-    trials = trials.rename(columns={"number": "trial", "value": f"mean {scoring}"})
-    top_trials = trials.sort_values(f"mean {scoring}", ascending=False).head(top)
+    trials = trials.rename(columns={"number": "trial", "value": f"mean {selection_metric}"})
+    top_trials = trials.sort_values(f"mean {selection_metric}", ascending=False).head(top)
 
     inner = nested_scores["inner_best"].mean()
     outer = nested_scores["validation"].mean()
     lines = [
-        f"Tuning on the whole development set ({len(study.trials)} Optuna trials, metric: {scoring})",
+        f"Tuning on the whole development set ({len(study.trials)} Optuna trials, metric: {selection_metric})",
         f"Best hyperparameters: {study.best_params}",
         f"Best mean CV score:   {study.best_value:.3f}  (maximum over all trials -- optimistic, not reported)",
         "",
@@ -138,6 +141,4 @@ def tuning_report(study, nested_scores: pd.DataFrame, scoring: str = "accuracy",
         f"  honest score on the outer folds (validation)     mean = {outer:.3f}",
         f"  optimism = {inner - outer:+.3f}   -> the honest one is the number to report",
     ]
-    text = "\n".join(lines)
-    print(text)
-    return text
+    return "\n".join(lines)
