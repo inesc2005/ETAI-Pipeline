@@ -1,6 +1,40 @@
 **Name: Inês Calado**  
 **Student Number: 20260537**
 
+## Week 8 -- XGBoost and feature selection
+
+The goal: add XGBoost, and test whether a model that uses fewer features is as good as one that uses all of them.
+
+### What was added, and where
+
+- **`requirements.txt`** -- `xgboost>=2.0`.
+- **`src/model.py`**
+  - `xgboost` in `_MODELS`: gradient boosting with extra brakes inside every split (`gamma`, `reg_alpha`, `reg_lambda`, `min_child_weight`).
+  - New `VoteSelector`: a random forest and gradient boosting vote for the features with above-average importance, an L1 logistic regression votes for the features it does not shrink to zero, and a feature stays if it gets at least `min_votes` votes.
+  - `build_pipeline()` adds the selector as a `"select"` step between preprocessing and the model when it is switched on. It also takes a cache folder (`memory`), so tuning does not refit preprocessing and selection in every trial.
+- `config.yaml`: `model` is now XGBoost; new `feature_selection` section (on/off, `min_votes`, and `select__min_votes` from 1 to 3 as a search space); `xgboost` search space.
+- `main.py`: passes the selection settings and a cache folder (deleted at the end of the run) to the pipeline; tunes `select__min_votes` together with the model; prints the features kept; adds a `feature_selection` column to the scoreboard.
+- `src/results.py`: the report header shows the selection setting.
+
+The selector learns from the labels, so it has to be a step of the `Pipeline`: it is refitted on the training rows of each fold and never sees the rows it is scored on. `add_engineered_features()` (week 6) is different: it uses fixed formulas, so it stays before the split.
+
+### Feature selection
+
+XGBoost, tuned with nested CV (30 trials, 5 inner folds, the same 5 outer folds as the scoreboard of week 7). Selection metric: ROC-AUC. Source: `results/runs.csv`.
+
+| Run | Untuned ROC-AUC | Tuned: nested CV ROC-AUC (mean ± std) | Floor | Features kept (final model) |
+|---|---|---|---|---|
+| Without selection | 0.724 | 0.727 ± 0.014 | 0.500 | 10 of 10 |
+| With selection | 0.720 | 0.725 ± 0.012 | 0.500 | 4 of 10: `age`, `juv_fel_count`, `juv_other_count`, `priors_count` |
+
+| Corrected paired t-test (ROC-AUC) | Mean difference | Folds won | p-value |
+|---|---|---|---|
+| With selection against without | -0.002 | 2/5 | 0.57 |
+
+The model with 4 features scores about the same as the one with all 10. The difference is only -0.002, much smaller than the variation between folds (±0.012 with selection, ±0.014 without), and p = 0.57 means it could easily be chance and noise. The model with selection also won only 2 of the 5 folds, so it is not consistently better or worse. Both are far above the floor (0.500), and tuning raised both a little (0.724 -> 0.727 without selection, 0.720 -> 0.725 with it). The 4 features kept are `age`, `juv_fel_count`, `juv_other_count` and `priors_count`; the other 6 were dropped. That doesn't prove the two models are identical, only that 5 folds show no real loss. 
+
+---
+
 ## Week 7 -- gradient boosting, and evaluating with probabilities
 
 The goal: add the boosting models, and judge every model on several metrics instead of just accuracy, with a scoreboard that tracks all runs for comparison.
@@ -25,7 +59,7 @@ The goal: add the boosting models, and judge every model on several metrics inst
 
 ### Selection metric
 
-I use ROC-AUC as the selection metric. COMPAS is a risk score used to rank people, and ROC-AUC measures exactly that: the probability that a random person who reoffended gets a higher score than a random person who did not, over every threshold at once, so the choice of the yes/no threshold stays a separate decision. It is also less noisy than accuracy, which only counts on which side of 0.5 each person falls: on the same week 5/6 folds, `corrected_paired_test()` gives p = 0.43 for random forest vs. decision tree on accuracy (no verdict; full output in `results/accuracy_vs_rocauc_corrected_test.txt`), while on ROC-AUC this week the equivalent comparison (gradient boosting vs. decision tree, below) gives p = 0.01.
+I use ROC-AUC as the selection metric. COMPAS is a risk score used to rank people, and ROC-AUC measures exactly that: the probability that a random person who reoffended gets a higher score than a random person who did not, over every threshold at once, so the choice of the yes/no threshold stays a separate decision. It is also often less noisy than accuracy, which only counts on which side of 0.5 each person falls: for gradient boosting vs. decision tree, the corrected test gives p = 0.01 on ROC-AUC and p = 0.10 on accuracy, on the same folds (not in every pair, though: against Naive Bayes both are clearly significant).
 
 ### Scoreboard
 
@@ -336,7 +370,7 @@ go on.
 │   ├── data.py               # loading
 │   ├── data_diagnostics.py   # missingness mechanism, domain-rule validity, duplicate + bucket-consistency checks
 │   ├── preprocessing.py      # cleaning + missingness flags + leak-safe split + imputation/encoding/scaling
-│   ├── model.py               # model construction (incl. oblique random forest and AdaBoost, week 6) + build_pipeline (preprocessing + model)
+│   ├── model.py               # model construction (incl. oblique random forest and AdaBoost, week 6), VoteSelector (week 8) + build_pipeline (preprocessing + feature selection + model)
 │   ├── evaluate.py           # cross-validation (week 4), out-of-fold reports + fairness check, several metrics from out-of-fold probabilities + corrected paired test (week 7)
 │   ├── tuning.py             # hyperparameter tuning with Optuna + nested cross-validation (week 5)
 │   └── results.py            # saves each run's report to disk, and its scores to the scoreboard results/runs.csv (week 7)
@@ -363,6 +397,7 @@ This table is updated after each practical class, so you can always see what cha
 | 5 | Hyperparameter tuning without leakage | New `src/tuning.py`: Optuna (seeded TPE) tunes the model on the development set only, every candidate scored by stratified 5-fold CV of the whole pipeline on the same folds (`tune_pipeline`); **nested cross-validation** (`nested_cross_validate`) gives the honest score of the tuned model, and its out-of-fold predictions feed the classification report and fairness check; `tuning_report` shows the best trial next to the nested score (optimism check); the final model is the tuned pipeline refit on all development rows; `build_pipeline()` in `src/model.py` replaces `make_pipeline`; `tuning` section in `config.yaml` (search spaces for decision tree, logistic regression, random forest); `optuna` in `requirements.txt`. The locked test set is still untouched |
 | 6 | Ensembles: random forest, oblique random forest, AdaBoost | Two new model types in `src/model.py`, registered in `_MODELS`: `oblique_random_forest` (a forest of trees that split on random linear combinations of the features, built from `SparseRandomProjection` + a decision tree inside `BaggingClassifier`) and `adaboost` (AdaBoost over decision trees of a chosen depth, stumps by default); the random forest is now the model `main.py` runs (200 trees); `config.yaml` gains search spaces for the three ensembles -- the forests tune tree size and decorrelation but not the number of trees (more trees never overfit), AdaBoost tunes its base trees' depth, number of rounds and learning rate; all five models compared with nested CV on the same folds; Challenge 1: `add_engineered_features()` in `src/preprocessing.py` (fixed-formula features, computed before the split), two sets tested with nested CV and left out of `numeric_features` because no model gained (see "Part 2 -- ensembles") |
 | 7 | Gradient boosting + evaluating with probabilities | Three new model types in `src/model.py`: `gradient_boosting`, `hist_gradient_boosting` and `naive_bayes`, with search spaces in `config.yaml` (gradient boosting is now the model `main.py` runs); evaluation reports **8 metrics** from out-of-fold **probabilities** (`cv.metrics`) and one **selection metric** (`cv.selection_metric`, ROC-AUC) that tuning maximises and runs are ranked by (`build_scorers()`, new `cross_validate_pipeline()`, `cv_report()`, tuning functions); the classification report adds the confusion matrix; `corrected_paired_test()` compares two models on the same folds (`scipy` in `requirements.txt`); new `save_scores()`: every run adds a row to the **scoreboard** `results/runs.csv` (score on each fold, untuned score, no-model floor); all 9 models run and compared (see "Week 7") |
+| 8 | XGBoost + feature selection | `xgboost` in `_MODELS`, now the model `main.py` runs, with its search space in `config.yaml` (`xgboost` in `requirements.txt`); new `VoteSelector` in `src/model.py`: three models vote for the features to keep; `build_pipeline()` adds it as a `"select"` step, so it is refitted inside every fold, and takes a cache folder so tuning does not refit it in every trial; new `feature_selection` section in `config.yaml`, with `select__min_votes` tuned together with the model; `main.py` prints the features kept, and the scoreboard and report header record the selection setting; XGBoost tuned with and without selection and compared with `corrected_paired_test()` (see "Week 8") |
 
 ## Environment setup
 
@@ -422,12 +457,13 @@ folder, on any OS:
 python main.py
 ```
 
-This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + model on the development set on several metrics (with the no-model floor on the same folds), tunes the hyperparameters if `tuning.enabled` is on, and prints a short summary:
+This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + feature selection (if enabled) + model on the development set on several metrics (with the no-model floor on the same folds), tunes the hyperparameters if `tuning.enabled` is on, and prints a short summary:
 - the **selection metric** (`cv.selection_metric`, ROC-AUC) with the hyperparameters from `config.yaml` (not tuned): mean ± std, the train-validation gap (a large gap = overfitting: the model looks much better on the data it was trained on than on data it has never seen) and the no-model floor;
 - with tuning on: the honest score of the tuned model (nested cross-validation) and the hyperparameters chosen;
 - the mean ± std of **every metric** in `cv.metrics`;
 - the **scoreboard**: every run saved in `results/runs.csv` on the same data and metric, best first;
 - the final model: the same (tuned) pipeline refit on all development rows. The locked test set is **not** evaluated.
+- with feature selection on: the features the final model keeps ("Features kept: ...").
 
 The full tables go to the results file: the per-fold tables, the tuning report (top trials, optimism check), the out-of-fold confusion matrix and classification report, and the false-positive-rate-by-race comparison between our model and COMPAS's own score (same rows).
 
