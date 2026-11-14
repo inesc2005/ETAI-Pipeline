@@ -1,0 +1,114 @@
+# Week 9 (option A): the same pipeline on a new dataset, Adult income (1994 US Census).
+# Run with: python main.py config_adult.yaml      (python main.py still runs COMPAS)
+# Only the data-specific sections differ from config.yaml; cv, model, selection and tuning are the same.
+
+data:
+  path: "data/adult_train.csv"
+  target: "income_over_50k"       # 1 = earns more than 50K a year
+  sensitive_attr: "sex"           # audited in the fairness check; never a feature
+  # id: not a feature; fnlwgt: a census sampling weight, not a trait of the person;
+  # race: the other sensitive attribute, kept out of the features too (the model shouldn't use it)
+  drop_columns: ["id", "fnlwgt", "race"]
+
+# locked test set: never used to fit, tune or choose anything. Do not change once set.
+test_set:
+  size: 0.2
+  random_state: 42
+
+# stratified k-fold CV on the development set; same random_state = same folds for every run
+cv:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  # reported for every run; fbeta_2 counts recall twice as much as precision
+  metrics: ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "fbeta_2", "roc_auc", "average_precision"]
+  selection_metric: "roc_auc"   # what tuning maximises and the scoreboard ranks runs by
+  n_jobs: 1                     # -1 = all CPU cores
+
+model:
+  # dummy | logistic_regression | naive_bayes | decision_tree | random_forest |
+  # oblique_random_forest | adaboost | gradient_boosting | hist_gradient_boosting | xgboost
+  type: "xgboost"
+  params:                       # default (untuned) hyperparameters
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 4
+    random_state: 42
+    n_jobs: -1
+
+# learned step between preprocessing and the model: keeps the features chosen by at least
+# min_votes of three models (random forest, gradient boosting, L1 logistic regression)
+feature_selection:
+  enabled: true
+  min_votes: 2                  # 1 (keep almost all) .. 3 (keep only unanimous)
+  random_state: 42
+  search_space:                 # tuned together with the model when tuning is on
+    select__min_votes: {type: int, low: 1, high: 3}
+
+# Optuna tuning on the development set; the honest score comes from nested CV
+tuning:
+  enabled: true
+  n_trials: 30                  # use ~5 while testing: tuning with selection takes minutes here
+  n_splits: 5                   # inner folds that score each candidate
+  random_state: 42
+  # keys are Pipeline parameter names; types: int / float (low, high, log) or categorical (choices)
+  search_spaces:
+    logistic_regression:
+      model__C: {type: float, low: 0.0001, high: 100, log: true}
+    xgboost:
+      model__n_estimators: {type: int, low: 50, high: 600, log: true}
+      model__learning_rate: {type: float, low: 0.01, high: 0.3, log: true}
+      model__max_depth: {type: int, low: 1, high: 8}
+      model__min_child_weight: {type: float, low: 1.0, high: 50.0, log: true}
+      model__subsample: {type: float, low: 0.5, high: 1.0}
+      model__colsample_bytree: {type: float, low: 0.5, high: 1.0}
+      model__reg_lambda: {type: float, low: 0.01, high: 10.0, log: true}
+      model__reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      model__gamma: {type: float, low: 0.0, high: 5.0}
+
+output:
+  results_dir: "results/adult"            # its own folder: Adult runs never mix with COMPAS's
+  scoreboard: "results/adult/runs.csv"
+
+# week 9: after the final refit, predict the new (unlabelled) people; every row gets a prediction
+predict:
+  path: "data/adult_new.csv"
+  output: "predictions/adult_new_predictions.csv"   # outside results/, so it is committed
+  threshold: 0.5
+
+diagnostics:
+  # impossible values -> NaN (Adult's own rules: 17-year-olds are valid here)
+  validity_rules:
+    age: "17 <= age <= 90"
+    hours_per_week: "1 <= hours_per_week <= 99"
+    capital_gain: "capital_gain >= 0"    # 99999 is the census top code, a real value: not a violation
+    capital_loss: "capital_loss >= 0"
+
+  id_column: "id"                   # no duplicates in Adult, the step stays
+
+  # "?" means unknown in workclass, occupation and native_country
+  placeholder_tokens: ["?"]
+  numeric_text_columns: []
+
+  canonical_maps: {}                # no spelling variants in Adult
+
+  # redundant: the same information as education_num ("Bachelors" is always 13)
+  columns_to_drop: ["education"]
+
+  bucket_consistency: {}
+
+preprocessing:
+  # v01-v25: undocumented columns, kept as features: feature selection decides
+  numeric_features: ["age", "education_num", "capital_gain", "capital_loss", "hours_per_week",
+                     "v01", "v02", "v03", "v04", "v05", "v06", "v07", "v08", "v09",
+                     "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18"]
+  categorical_features: ["workclass", "marital_status", "occupation", "relationship", "native_country",
+                         "v19", "v20", "v21", "v22", "v23", "v24", "v25"]
+  # missing workclass/occupation carries information (those people earn > 50K half as often): flag it
+  mnar_columns: ["workclass", "occupation"]
+  engineered_features: false    # the week 6 features use COMPAS's columns
+  numeric_impute_strategy: "median"         # median | mean | knn
+  categorical_impute_strategy: "most_frequent"
+  scaler: "standard"                        # standard | minmax | robust | none
+  random_state: 42                          # target encoder's internal folds
+  encoder: "target"                         # one column per category: suits native_country's 41 values

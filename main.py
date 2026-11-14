@@ -2,7 +2,8 @@
 Entry point for the predictive pipeline.
 
 Run with:
-    python main.py
+    python main.py                      # COMPAS (config.yaml)
+    python main.py config_adult.yaml    # week 9: Adult income, same pipeline, its own config
 
 This orchestrates the full pipeline:
     load config -> load data -> clean -> drop duplicate rows -> add engineered features -> add missingness flags
@@ -14,11 +15,14 @@ This orchestrates the full pipeline:
     -> refit the final (tuned) model on the whole development set
     -> one row on the scoreboard (results/runs.csv) + the full report in results/
 """
+import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 
 import optuna
+import pandas as pd
 import yaml
 from sklearn.model_selection import StratifiedKFold
 
@@ -47,8 +51,8 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def main():
-    config = load_config()
+def main(config_path: str = "config.yaml"):
+    config = load_config(config_path)   # week 9: the config is chosen on the command line
     run = datetime.now().strftime("%Y%m%d_%H%M%S")    # one id for this run: on the scoreboard and in the report's name
     model_type = config["model"]["type"]
 
@@ -56,8 +60,12 @@ def main():
     df_clean = clean_dataset(df, config["diagnostics"])
     df_clean = drop_duplicate_rows(df_clean, config["diagnostics"].get("id_column"))  # before the split
     # week 6: new features from fixed formulas (nothing learned), so safe before the split.
-    # The model only uses the ones listed in preprocessing.numeric_features.
-    df_clean = add_engineered_features(df_clean)
+    # The model only uses the ones listed in preprocessing.numeric_features. They use COMPAS's
+    # columns, so the config switches them on (week 9).
+    engineered = config["preprocessing"].get("engineered_features", False)
+    if engineered:
+        df_clean = add_engineered_features(df_clean)
+    benchmark = config["data"].get("benchmark") or {}   # an existing score for the fairness check (optional)
 
     X, y, extras = split_features_target(
         df_clean,
@@ -65,6 +73,7 @@ def main():
         sensitive_attr=config["data"]["sensitive_attr"],
         drop_columns=config["data"]["drop_columns"],
         mnar_columns=config["preprocessing"]["mnar_columns"],
+        benchmark_column=benchmark.get("column"),
     )
 
     # the final test set is set aside HERE and never used again in this script: every decision
@@ -156,7 +165,8 @@ def main():
     for name in metrics:
         print(f"  {name:<18s} {final_scores[name].mean():.3f} ± {final_scores[name].std(ddof=1):.3f}")
     report += "\n\n" + oof_classification_report(y_dev, oof_proba)
-    report += "\n" + fairness_report(y_dev, oof_proba, extras_dev, sensitive_attr=config["data"]["sensitive_attr"])
+    report += "\n" + fairness_report(y_dev, oof_proba, extras_dev, sensitive_attr=config["data"]["sensitive_attr"],
+                                       benchmark=benchmark or None)
 
     # the model we'd actually use: same (tuned) pipeline refit on EVERY development row.
     # CV estimated how well this recipe does; it didn't produce a model.
@@ -169,6 +179,11 @@ def main():
         all_features = pipeline.named_steps["prep"].get_feature_names_out()
         kept = pipeline.named_steps["select"].get_feature_names_out(all_features)
         footer += f"\nFeatures kept: {len(kept)} of {len(all_features)}: {', '.join(kept)}"
+
+    # week 9: predict new, unlabelled rows with the refit pipeline (only if the config has `predict`)
+    predict_config = config.get("predict")
+    if predict_config:
+        footer += "\n" + predict_new_rows(pipeline, config, predict_config, engineered)
     report += "\n" + footer + "\n"
 
     # week 7: the scoreboard: one row per run, with the score on each fold, so any two runs on the same data and folds can be compared with corrected_paired_test()
@@ -197,5 +212,36 @@ def main():
     print(f"\n{footer}\nFull report (per-fold tables, tuning, confusion matrix, fairness): {path}")
 
 
+def predict_new_rows(pipeline, config: dict, predict_config: dict, engineered: bool) -> str:
+    """
+    Predicts the rows of `predict_config["path"]` with the fitted `pipeline` and saves the id, the
+    probability of class 1 and the 0/1 prediction to `predict_config["output"]`. The new rows get the
+    same cleaning and feature split as the training data, but no `drop_duplicate_rows`: every row
+    needs a prediction, so rows out = rows in.
+    """
+    new_raw = load_data(predict_config["path"])
+    new_clean = clean_dataset(new_raw, config["diagnostics"])
+    if engineered:
+        new_clean = add_engineered_features(new_clean)
+    X_new, _, _ = split_features_target(
+        new_clean,
+        target=config["data"]["target"],          # not in the new file: y comes back as None
+        sensitive_attr=config["data"]["sensitive_attr"],
+        drop_columns=config["data"]["drop_columns"],
+        mnar_columns=config["preprocessing"]["mnar_columns"],
+    )
+    threshold = predict_config.get("threshold", 0.5)
+    proba = pipeline.predict_proba(X_new)[:, 1]
+    id_column = config["diagnostics"].get("id_column", "id")
+    predictions = pd.DataFrame({id_column: new_clean[id_column].values, "probability": proba,
+                                "prediction": (proba >= threshold).astype(int)})
+    if len(predictions) != len(new_raw):
+        raise ValueError(f"{len(new_raw)} rows in, {len(predictions)} predictions out: a row was dropped")
+    os.makedirs(os.path.dirname(predict_config["output"]) or ".", exist_ok=True)
+    predictions.to_csv(predict_config["output"], index=False)
+    return (f"Predictions: {len(predictions)} new rows (of {len(new_raw)}) saved to {predict_config['output']} "
+            f"({predictions['prediction'].mean():.1%} predicted as class 1, threshold {threshold})")
+
+
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1] if len(sys.argv) > 1 else "config.yaml")

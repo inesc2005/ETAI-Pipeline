@@ -39,6 +39,8 @@ def canonicalize_categories(df: pd.DataFrame, canonical_maps: dict, placeholder_
     """Normalizes spelling/casing variants of a category into one canonical label"""
     out = df.copy()
     for col, mapping in canonical_maps.items():
+        if col not in out.columns:      # a map for a column this dataset doesn't have
+            continue
         cleaned = out[col].astype(str).str.strip()
         lowered = cleaned.str.lower()
         out[col] = lowered.map(mapping).fillna(cleaned)
@@ -63,16 +65,19 @@ def clean_dataset(df: pd.DataFrame, diagnostics_config: dict) -> pd.DataFrame:
 
     out = df.copy()
 
-    # numeric-looking columns that loaded as text because of placeholder tokens
+    # placeholder tokens can only be in text columns. Week 9 fix: this used to test `dtype == object`,
+    # but pandas 3 reads text as `str`, so the loop never ran (COMPAS was covered by canonical_maps)
     for col in out.columns:
-        if out[col].dtype == object:
+        if not pd.api.types.is_numeric_dtype(out[col]):
             mask = find_placeholder_rows(out[col], placeholder_tokens)
             out.loc[mask, col] = np.nan  # replace placeholder tokens with real NaN
 
     if canonical_maps:
         out = canonicalize_categories(out, canonical_maps, placeholder_tokens)  # normalize category labels
 
-    for col in ["priors_count", "prior_offenses"]:
+    # numeric columns that loaded as text because of placeholder tokens (week 9: listed in the
+    # config, instead of naming COMPAS's columns here)
+    for col in diagnostics_config.get("numeric_text_columns", []):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")  # force back to numeric dtype
 
@@ -149,7 +154,7 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, drop_columns: list,
-                          mnar_columns: list = ()):
+                          mnar_columns: list = (), benchmark_column: str = None):
     """
     Splits a cleaned dataframe into (X, y, extras), splits the columns.
     Adds the `<col>_was_missing` flags first (see `add_missing_flags`), so anything that builds
@@ -158,8 +163,9 @@ def split_features_target(df: pd.DataFrame, target: str, sensitive_attr: str, dr
     df = add_missing_flags(df, mnar_columns)
     y = df.get(target) # target variable we want to predict
 
-    # kept aside (like race and score_text) for later evaluation, but not used as model input features
-    extras_columns = [c for c in (sensitive_attr, "score_text") if c in df.columns]
+    # kept aside for later evaluation, but not used as model input features: the sensitive attribute
+    # and, if the config names one, an existing score to compare with (COMPAS: score_text)
+    extras_columns = [c for c in (sensitive_attr, benchmark_column) if c and c in df.columns]
     extras = df[extras_columns].copy() if extras_columns else None
 
     drop_these = {target, sensitive_attr, *drop_columns}

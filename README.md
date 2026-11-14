@@ -1,6 +1,73 @@
 **Name: Inês Calado**  
 **Student Number: 20260537**
 
+## Week 9 -- Beyond COMPAS (option A: Adult income)
+
+The goal: run the same pipeline on a new dataset, Adult income ("does this person earn more than 50K a year?", 1994 US Census), and find the parts of the code that only worked for COMPAS.
+
+### How to run
+
+```bash
+python main.py                      # COMPAS, exactly as before (config.yaml)
+python main.py config_adult.yaml    # Adult income (config_adult.yaml)
+```
+
+Adult has its own config, its own output folder (`results/adult/`, with its own scoreboard) and a `predict` section: after the final refit, the pipeline predicts the 2,000 people of `data/adult_new.csv` and saves `id`, probability and 0/1 prediction to `predictions/adult_new_predictions.csv` (2,000 rows in, 2,000 out).
+
+Choices in `config_adult.yaml`: `sex` is the audited sensitive attribute and `race` is kept out of the features too; `fnlwgt` (a census sampling weight) and `id` are not features; `education` is dropped because `education_num` holds the same information; `"?"` is the placeholder token; `workclass` and `occupation` get a missingness flag (people with them missing earn > 50K about half as often); Adult's own validity rules (age 17-90, so 17-year-olds stay); the 25 undocumented columns `v01`-`v25` are kept as features, for feature selection to decide.
+
+### What broke, why, and how I fixed it
+
+| What broke | Why | Fix |
+|---|---|---|
+| `"?"` stayed as a category in `workclass`, `occupation` and `native_country`, with no error | `clean_dataset()` only replaced placeholder tokens in columns of type `object`, but pandas 3 reads text as type `str`, so that loop never ran. COMPAS hid it: its text columns were also cleaned by `canonical_maps` | the loop now runs on every non-numeric column (`src/preprocessing.py`) |
+| COMPAS column names in `src/` | `clean_dataset()` converted `priors_count` and `prior_offenses` back to numbers by name | moved to the config: `diagnostics.numeric_text_columns` |
+| `add_engineered_features()` would stop with a `KeyError` | the week 6 features use COMPAS's columns (`priors_count`, `age`, ...) | runs only if `preprocessing.engineered_features: true` (COMPAS: true, Adult: false) |
+| The fairness report would stop with a `KeyError` | it always compared with COMPAS's own score, `score_text`, and `split_features_target()` always kept that column | the comparison is optional: `data.benchmark` in the config (COMPAS only) |
+| No way to choose another config | `main.py` always read `config.yaml` | `python main.py <config>`, default `config.yaml` |
+| No way to predict new people | the pipeline had only ever scored labelled data | new `predict_new_rows()` in `main.py`: same cleaning (but no `drop_duplicate_rows`, every row needs a prediction), refit pipeline, one row out per row in |
+
+Check that COMPAS didn't change: with the old and the new code, the cleaned COMPAS data, `X` and `y` are identical, and a run gives exactly the same scores. The cleaning check of the notebook passes on Adult: after `clean_dataset()` no `"?"` is left, and `workclass`, `occupation` and `native_country` have 379, 381 and 86 missing values.
+
+### Results
+
+XGBoost (the model in `config.yaml`), tuned with nested CV (30 trials, 5 inner folds, 5 outer folds), with and without feature selection. Source: `results/adult/runs.csv`.
+
+| Run | Untuned ROC-AUC | Tuned ROC-AUC | Tuned accuracy | Tuned F1 | Features kept (final model) |
+|---|---|---|---|---|---|
+| No model (floor) | 0.500 | -- | 0.76 | 0.00 | -- |
+| Without selection | 0.905 | 0.908 ± 0.016 | 0.857 ± 0.012 | 0.661 ± 0.028 | 37 of 37 |
+| With selection | 0.913 | 0.910 ± 0.015 | 0.861 ± 0.008 | 0.677 ± 0.027 | 8 of 37 |
+| Target | -- | ≥ 0.90 | ≥ 0.855 | ≥ 0.66 | -- |
+
+The floor's accuracy and F1 are the notebook's ("always ≤ 50K"); its ROC-AUC comes from the runs.
+
+| Corrected paired t-test (ROC-AUC) | Mean difference | Folds won | p-value |
+|---|---|---|---|
+| With selection against without | +0.002 | 5/5 | 0.07 |
+
+Features kept with selection: `age`, `education_num`, `capital_gain`, `capital_loss`, `hours_per_week`, `marital_status`, `occupation`, `relationship`. None of the 25 `v` columns was kept, and neither were the missingness flags. `min_votes` was 1, 1, 2, 2, 2 across the outer folds and 1 on all development rows. The predictions file comes from this run.
+
+The hardest assumption to find was the `"?"` one, because nothing failed: the placeholder just stayed as one more category, and COMPAS never showed it because another step cleaned its columns. I compared two runs of the same tuned XGBoost, one with feature selection and one without. Both reach the three targets, but the run without selection only just makes it (accuracy 0.857 for a target of 0.855, F1 0.661 for 0.66). The run with selection clears them by more and varies less from fold to fold (accuracy ± 0.008 instead of ± 0.012), while using only 8 of the 37 columns. It scored higher in all 5 folds, but only by a little (+0.002, p = 0.07, just above 0.05), so the gain is not certain. What got the pipeline to the targets was correct cleaning and XGBoost, since the run without selection already reaches them; selection then helped a little by removing the 25 undocumented `v` columns, which only added noise.
+
+**Leakage check.** The scores are much higher than on COMPAS (about 0.72), so I checked for leakage: a column that gives the answer away, for example a salary recorded after the fact. A model using such a column looks excellent in testing but is useless on new people, because that value doesn't exist yet when you predict.
+
+How the check works (`experiments/leakage_check.py`, run with `python -m experiments.leakage_check`):
+1. Take each feature alone, with no model, on the 6,000 rows of `adult_train.csv` after cleaning.
+2. Turn it into a score: a numeric feature is its own value (e.g. more hours per week = higher score); a categorical feature becomes each category's share of people earning > 50K.
+3. Measure how well that score alone separates people earning > 50K from the rest, with ROC-AUC: 1.0**~~ means it separates them perfectly (the column "knows" the answer: a leak), 0.5 means it is no better than chance.
+
+| Feature alone | ROC-AUC |
+|---|---|
+| `relationship` (best) | 0.778 |
+| `marital_status` | 0.767 |
+| `occupation` | 0.729 |
+| `v01`-`v25` | 0.500-0.536 |
+
+No column comes close to 1.0: the best one, `relationship`, gets 0.778, so the model reaches 0.91 by combining several useful features, not because one of them holds the answer. The `v` columns are close to chance (0.5), which is why selection dropped them. Two other signs agree: the train-validation gap is small (+0.015 for the tuned run with selection), and every score is a nested CV score on the development set, with the locked test set never used. The check only looks at one column at a time, so it would miss a leak hidden in a combination of columns; it is a quick diagnostic, not a proof. The full list is saved to `results/adult/leakage_check.txt`.
+
+---
+
 ## Week 8 -- XGBoost and feature selection
 
 The goal: add XGBoost, and test whether a model that uses fewer features is as good as one that uses all of them.
@@ -364,7 +431,9 @@ go on.
 ```
 .
 ├── main.py                # entry point: run the whole pipeline
-├── config.yaml             # all tunable settings live here
+├── config.yaml             # all tunable settings live here (COMPAS)
+├── config_adult.yaml       # week 9: the same settings for the Adult income data
+├── predictions/            # week 9: predictions for data/adult_new.csv
 ├── requirements.txt
 ├── src/
 │   ├── data.py               # loading
@@ -378,7 +447,8 @@ go on.
 │   ├── encoder_scaler_grid.py # week 3: picks encoder/scaler via an empirical grid (single splits, pre-CV)
 │   ├── compare_models.py     # week 4: 4 models, week 3 vs. now + holdout vs. CV tables
 │   ├── improve_pipeline.py   # week 4: one change at a time, compared with the same CV folds
-│   └── final_test.py         # week 4: one-off assessment on the locked test set
+│   ├── final_test.py         # week 4: one-off assessment on the locked test set
+│   └── leakage_check.py      # week 9: ROC-AUC of each feature alone, to check that no column gives the answer away
 ├── results/                # created automatically -- one report per run + runs.csv, the scoreboard of all runs (not tracked in git)
 └── data/
     ├── compas_two_year_recidivism.csv
@@ -398,6 +468,7 @@ This table is updated after each practical class, so you can always see what cha
 | 6 | Ensembles: random forest, oblique random forest, AdaBoost | Two new model types in `src/model.py`, registered in `_MODELS`: `oblique_random_forest` (a forest of trees that split on random linear combinations of the features, built from `SparseRandomProjection` + a decision tree inside `BaggingClassifier`) and `adaboost` (AdaBoost over decision trees of a chosen depth, stumps by default); the random forest is now the model `main.py` runs (200 trees); `config.yaml` gains search spaces for the three ensembles -- the forests tune tree size and decorrelation but not the number of trees (more trees never overfit), AdaBoost tunes its base trees' depth, number of rounds and learning rate; all five models compared with nested CV on the same folds; Challenge 1: `add_engineered_features()` in `src/preprocessing.py` (fixed-formula features, computed before the split), two sets tested with nested CV and left out of `numeric_features` because no model gained (see "Part 2 -- ensembles") |
 | 7 | Gradient boosting + evaluating with probabilities | Three new model types in `src/model.py`: `gradient_boosting`, `hist_gradient_boosting` and `naive_bayes`, with search spaces in `config.yaml` (gradient boosting is now the model `main.py` runs); evaluation reports **8 metrics** from out-of-fold **probabilities** (`cv.metrics`) and one **selection metric** (`cv.selection_metric`, ROC-AUC) that tuning maximises and runs are ranked by (`build_scorers()`, new `cross_validate_pipeline()`, `cv_report()`, tuning functions); the classification report adds the confusion matrix; `corrected_paired_test()` compares two models on the same folds (`scipy` in `requirements.txt`); new `save_scores()`: every run adds a row to the **scoreboard** `results/runs.csv` (score on each fold, untuned score, no-model floor); all 9 models run and compared (see "Week 7") |
 | 8 | XGBoost + feature selection | `xgboost` in `_MODELS`, now the model `main.py` runs, with its search space in `config.yaml` (`xgboost` in `requirements.txt`); new `VoteSelector` in `src/model.py`: three models vote for the features to keep; `build_pipeline()` adds it as a `"select"` step, so it is refitted inside every fold, and takes a cache folder so tuning does not refit it in every trial; new `feature_selection` section in `config.yaml`, with `select__min_votes` tuned together with the model; `main.py` prints the features kept, and the scoreboard and report header record the selection setting; XGBoost tuned with and without selection and compared with `corrected_paired_test()` (see "Week 8") |
+| 9 | Beyond COMPAS (option A: Adult income) | `main.py` takes the config file as an argument (`python main.py config_adult.yaml`); new `config_adult.yaml` with its own data, cleaning rules, features and output folder; fixed the parts that only worked for COMPAS: placeholder tokens were never replaced in text columns read as `str` (pandas 3), COMPAS column names moved from `src/` to the config (`numeric_text_columns`), the week 6 features and the comparison with COMPAS's own score in the fairness report are now switched on in the config (`engineered_features`, `benchmark`); new `predict_new_rows()`: predictions for `data/adult_new.csv` saved to `predictions/`; COMPAS gives exactly the same numbers as before (see "Week 9") |
 
 ## Environment setup
 
@@ -456,6 +527,8 @@ folder, on any OS:
 ```bash
 python main.py
 ```
+
+To run another problem, pass its config: `python main.py config_adult.yaml` (week 9).
 
 This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + feature selection (if enabled) + model on the development set on several metrics (with the no-model floor on the same folds), tunes the hyperparameters if `tuning.enabled` is on, and prints a short summary:
 - the **selection metric** (`cv.selection_metric`, ROC-AUC) with the hyperparameters from `config.yaml` (not tuned): mean ± std, the train-validation gap (a large gap = overfitting: the model looks much better on the data it was trained on than on data it has never seen) and the no-model floor;

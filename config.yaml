@@ -5,6 +5,9 @@ data:
   target: "two_year_recid"
   sensitive_attr: "race"          # never a feature; used only for the fairness check
   drop_columns: ["id", "decile_score", "score_text"]  # id and COMPAS's own score, never model inputs
+  # an existing score shown next to the model in the fairness check (optional): any value other
+  # than negative_value counts as "predicted 1"
+  benchmark: {column: "score_text", negative_value: "Low", label: "COMPAS's own score"}
 
 # locked test set: never used to fit, tune or choose anything. Do not change once set.
 test_set:
@@ -121,6 +124,7 @@ diagnostics:
 
   # stand-in tokens for missing data
   placeholder_tokens: ["-", "?", "n/a", "N/A", "na", "NA", ""]
+  numeric_text_columns: ["priors_count", "prior_offenses"]   # numbers that load as text because of the tokens
 
   # spelling/casing variants -> one label per column
   canonical_maps:
@@ -167,6 +171,7 @@ preprocessing:
   numeric_features: ["age", "juv_fel_count", "juv_misd_count", "juv_other_count", "priors_count"]
   # engineered features (add to numeric_features to use them; tested, none helped -- see README):
   # priors_per_adult_year, has_juvenile_record, priors_bin, felony_with_priors, log_priors
+  engineered_features: true     # compute them (they use COMPAS's columns)
   categorical_features: ["sex", "age_cat", "c_charge_degree"]
   mnar_columns: ["priors_count", "c_charge_degree"]   # get a "<col>_was_missing" flag
   numeric_impute_strategy: "median"         # median | mean | knn
