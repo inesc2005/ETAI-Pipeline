@@ -1,6 +1,84 @@
 **Name: Inês Calado**  
 **Student Number: 20260537**
 
+## Week 10 -- Missing values and predicting new people
+
+### The imputer as a setting
+
+`numeric_impute_strategy` in `config.yaml` now chooses one of five imputers for the numeric columns: `median`, `mean`, `knn`, `iterative` (MICE, one completed dataset) and `random_forest` (the missForest idea: each column is predicted from the others by a random forest). None of them uses the target, so they run the same way in cross-validation and on new people, who have no label. All the imputers now work in the same order: the numeric columns are scaled first and then imputed. The KNN imputer already did this, because it measures distances between rows and the columns must be on one scale; `iterative` and `random_forest` also compare columns with each other, so they need it too. For the median the order makes no difference: last week's run gives exactly the same score on every fold.
+
+XGBoost with the hyperparameters in `config.yaml` (no tuning), feature selection on, 5-fold CV on the 5,771 development rows. Only the imputer changes. The gaps the imputers have to fill are in the table below. Source: `results/imputer_comparison.txt` (`python -m experiments.imputer_comparison`).
+
+| Numeric column | Gaps (of 5,771 development rows) |
+|---|---|
+| `age` | 120 (2.1%) |
+| `juv_fel_count` | 174 (3.0%) |
+| `priors_count` | 397 (6.9%) |
+
+**Table 1 -- XGBoost** (the model in `config.yaml`, its hyperparameters):
+
+| Imputer | ROC-AUC (mean ± std) | Difference against the median | Folds won | p-value | Time (5 folds) |
+|---|---|---|---|---|---|
+| median (kept) | 0.7201 ± 0.0127 | -- | -- | -- | 6 s |
+| knn | 0.7182 ± 0.0139 | -0.0019 | 1/5 | 0.39 | 8 s |
+| iterative | 0.7207 ± 0.0143 | +0.0007 | 3/5 | 0.75 | 7 s |
+| random_forest | 0.7206 ± 0.0124 | +0.0005 | 3/5 | 0.56 | 48 s |
+
+The differences and p-values come from `corrected_paired_test()`, each imputer against the median, on the same folds.
+
+I keep the median. No imputer is clearly better: every difference is smaller than 0.002 and every p-value is far above 0.05 (0.39 to 0.75), so they are all within noise. The random forest imputer takes 8 times as long (48 s against 6 s) for +0.0005, and the median is the simplest to explain. The notebook gives a likely reason: these imputers only see the numeric columns, and those say little about each other.
+
+To see whether this depends on the model, I repeated the comparison with logistic regression (default hyperparameters, same folds, `python -m experiments.imputer_comparison config.yaml logistic_regression`). Source: `results/imputer_comparison_logistic_regression.txt`.
+
+
+**Table 2 -- logistic regression** (default hyperparameters):
+
+| Imputer | ROC-AUC (mean ± std) | Difference against the median | Folds won | p-value | Time (5 folds) |
+|---|---|---|---|---|---|
+| median | 0.7161 ± 0.0116 | -- | -- | -- | 3 s |
+| knn | 0.7108 ± 0.0105 | -0.0053 | 0/5 | 0.19 | 4 s |
+| iterative | 0.7179 ± 0.0108 | +0.0018 | 4/5 | 0.24 | 3 s |
+| random_forest | 0.7172 ± 0.0113 | +0.0011 | 4/5 | 0.37 | 26 s |
+
+The picture is the same: no p-value is below 0.05. Here `iterative` and `random_forest` win 4 of 5 folds, but by 0.002 at most, which could still be noise, and `knn` is the worst. I did not test other models.
+
+
+### Predicting new data
+
+```bash
+python main.py                                                 # train, evaluate, and save the final pipeline to models/model.joblib
+python predict.py data/compas_new_people.csv predictions.csv   # predict new people with the saved pipeline, no training
+```
+
+At the end of every run, `main.py` saves the final pipeline (refit on all development rows) to `output.model_path`. The file holds everything the pipeline learned in training: the medians, the scale, the encodings, the features kept and the model. `predict.py` loads it, cleans the new file with the same rules as training (but without `drop_duplicate_rows()`, because every row needs an answer) and writes one row per input row:
+- `id`: the person's id;
+- `probability`: the model's probability that the person reoffends within two years;
+- `prediction`: 1 if that probability is at least 0.5, otherwise 0.
+
+Nothing is learned from the new file. The model file is not in git (`models/` is in `.gitignore`), so `python main.py` has to run once first. 
+
+`data/compas_new_people.csv` has 20 people without the target, and some of them are messy on purpose:
+
+| Row | What is special | Probability | Prediction |
+|---|---|---|---|
+| 3 (id 900004) | `priors_count` is `"?"` | 0.591 | 1 |
+| 7 (id 900008) | no `age` (id 900002, row 1, also has none: 0.293, prediction 0) | 0.544 | 1 |
+| 11 (id 900012) | `c_charge_degree` is `"X"`, a category never seen in training | 0.842 | 1 |
+| 14 and 15 (ids 900015, 900016) | the same values twice | 0.457 | 0 |
+
+| Rows in | Rows out | Predicted 1 |
+|---|---|---|
+| 20 | 20 | 6 (30%) |
+
+The cleaning turns `"?"` into a gap, and the saved median fills it, like the missing age. The target encoder gives an unseen category the overall reoffending rate, so `"X"` doesn't crash anything. The two identical rows are both kept and get the same answer.
+
+| What broke | Why | Fix |
+|---|---|---|
+| `predict.py` stopped with `KeyError: 'decile_score'` | new people have no COMPAS score, but `clean_dataset()` applied every validity rule, also to columns the file doesn't have | the rules only run on columns the file has, like every other step of `clean_dataset()` (`src/preprocessing.py`) |
+
+
+---
+
 ## Week 9 -- Beyond COMPAS (option A: Adult income)
 
 The goal: run the same pipeline on a new dataset, Adult income ("does this person earn more than 50K a year?", 1994 US Census), and find the parts of the code that only worked for COMPAS.
@@ -431,9 +509,11 @@ go on.
 ```
 .
 ├── main.py                # entry point: run the whole pipeline
+├── predict.py             # week 10: predicts a new CSV with the saved model, no training
 ├── config.yaml             # all tunable settings live here (COMPAS)
 ├── config_adult.yaml       # week 9: the same settings for the Adult income data
 ├── predictions/            # week 9: predictions for data/adult_new.csv
+├── models/                 # week 10: the final fitted pipeline of the last run (not tracked in git)
 ├── requirements.txt
 ├── src/
 │   ├── data.py               # loading
@@ -448,10 +528,12 @@ go on.
 │   ├── compare_models.py     # week 4: 4 models, week 3 vs. now + holdout vs. CV tables
 │   ├── improve_pipeline.py   # week 4: one change at a time, compared with the same CV folds
 │   ├── final_test.py         # week 4: one-off assessment on the locked test set
-│   └── leakage_check.py      # week 9: ROC-AUC of each feature alone, to check that no column gives the answer away
+│   ├── leakage_check.py      # week 9: ROC-AUC of each feature alone, to check that no column gives the answer away
+│   └── imputer_comparison.py # week 10: the numeric imputers compared on the same folds, with the corrected test
 ├── results/                # created automatically -- one report per run + runs.csv, the scoreboard of all runs (not tracked in git)
 └── data/
     ├── compas_two_year_recidivism.csv
+    ├── compas_new_people.csv  # week 10: 20 new people without the target, for predict.py
     └── README.md            # problem description + full data dictionary
 ```
 
@@ -469,6 +551,7 @@ This table is updated after each practical class, so you can always see what cha
 | 7 | Gradient boosting + evaluating with probabilities | Three new model types in `src/model.py`: `gradient_boosting`, `hist_gradient_boosting` and `naive_bayes`, with search spaces in `config.yaml` (gradient boosting is now the model `main.py` runs); evaluation reports **8 metrics** from out-of-fold **probabilities** (`cv.metrics`) and one **selection metric** (`cv.selection_metric`, ROC-AUC) that tuning maximises and runs are ranked by (`build_scorers()`, new `cross_validate_pipeline()`, `cv_report()`, tuning functions); the classification report adds the confusion matrix; `corrected_paired_test()` compares two models on the same folds (`scipy` in `requirements.txt`); new `save_scores()`: every run adds a row to the **scoreboard** `results/runs.csv` (score on each fold, untuned score, no-model floor); all 9 models run and compared (see "Week 7") |
 | 8 | XGBoost + feature selection | `xgboost` in `_MODELS`, now the model `main.py` runs, with its search space in `config.yaml` (`xgboost` in `requirements.txt`); new `VoteSelector` in `src/model.py`: three models vote for the features to keep; `build_pipeline()` adds it as a `"select"` step, so it is refitted inside every fold, and takes a cache folder so tuning does not refit it in every trial; new `feature_selection` section in `config.yaml`, with `select__min_votes` tuned together with the model; `main.py` prints the features kept, and the scoreboard and report header record the selection setting; XGBoost tuned with and without selection and compared with `corrected_paired_test()` (see "Week 8") |
 | 9 | Beyond COMPAS (option A: Adult income) | `main.py` takes the config file as an argument (`python main.py config_adult.yaml`); new `config_adult.yaml` with its own data, cleaning rules, features and output folder; fixed the parts that only worked for COMPAS: placeholder tokens were never replaced in text columns read as `str` (pandas 3), COMPAS column names moved from `src/` to the config (`numeric_text_columns`), the week 6 features and the comparison with COMPAS's own score in the fairness report are now switched on in the config (`engineered_features`, `benchmark`); new `predict_new_rows()`: predictions for `data/adult_new.csv` saved to `predictions/`; COMPAS gives exactly the same numbers as before (see "Week 9") |
+| 10 | Missing values + predicting new people | New `_NUMERIC_IMPUTERS` in `src/preprocessing.py`: `numeric_impute_strategy` chooses `median`, `mean`, `knn`, `iterative` (MICE) or `random_forest` (missForest), with their options in `config.yaml`; all imputers now scale the numeric columns first and then impute (the KNN imputer already did); the imputer is printed, saved on the scoreboard and in the report header; four imputers compared with `corrected_paired_test()` (`experiments/imputer_comparison.py`), median kept; `main.py` saves the final pipeline to `output.model_path` with `joblib` (`joblib` in `requirements.txt`, `models/` in `.gitignore`); new `predict.py`: `python predict.py <csv> [output] [--config]` predicts new people with the saved pipeline, one row per input row; `data/compas_new_people.csv`; fixed `clean_dataset()` stopping on files without `decile_score` (see "Week 10") |
 
 ## Environment setup
 
@@ -529,6 +612,8 @@ python main.py
 ```
 
 To run another problem, pass its config: `python main.py config_adult.yaml` (week 9).
+
+Each run also saves the final pipeline to `models/model.joblib` (week 10), so new people can be predicted without training: `python predict.py data/compas_new_people.csv predictions.csv`.
 
 This loads `config.yaml`, cleans the data, locks the test set away, cross-validates preprocessing + feature selection (if enabled) + model on the development set on several metrics (with the no-model floor on the same folds), tunes the hyperparameters if `tuning.enabled` is on, and prints a short summary:
 - the **selection metric** (`cv.selection_metric`, ROC-AUC) with the hyperparameters from `config.yaml` (not tuned): mean ± std, the train-validation gap (a large gap = overfitting: the model looks much better on the data it was trained on than on data it has never seen) and the no-model floor;

@@ -107,6 +107,7 @@ tuning:
 
 output:
   results_dir: "results"            # one full report per run
+  model_path: "models/model.joblib" # week 10: the final fitted pipeline, used by predict.py (overwritten each run)
   scoreboard: "results/runs.csv"    # one row per run; delete it if the data, cleaning or folds change
 
 diagnostics:
@@ -174,8 +175,11 @@ preprocessing:
   engineered_features: true     # compute them (they use COMPAS's columns)
   categorical_features: ["sex", "age_cat", "c_charge_degree"]
   mnar_columns: ["priors_count", "c_charge_degree"]   # get a "<col>_was_missing" flag
-  numeric_impute_strategy: "median"         # median | mean | knn
+  numeric_impute_strategy: "median"         # median | mean | knn | iterative | random_forest (week 10)
+  knn_neighbors: 5                          # knn
+  imputer_max_iter: 10                      # iterative, random_forest
+  imputer_n_estimators: 50                  # random_forest (trees per column)
   categorical_impute_strategy: "most_frequent"
   scaler: "standard"                        # standard | minmax | robust | none
-  random_state: 42                          # target encoder's internal folds
+  random_state: 42                          # target encoder's internal folds and the model-based imputers
   encoder: "target"                         # onehot | ordinal | count | target

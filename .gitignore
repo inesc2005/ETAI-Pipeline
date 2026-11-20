@@ -5,3 +5,6 @@ __pycache__/
 .ipynb_checkpoints/
 *.egg-info/
 results/
+models/
+predictions.csv
+predictions_adult.csv

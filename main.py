@@ -14,6 +14,7 @@ This orchestrates the full pipeline:
     -> out-of-fold confusion matrix, classification report + fairness check
     -> refit the final (tuned) model on the whole development set
     -> one row on the scoreboard (results/runs.csv) + the full report in results/
+    -> week 10: the refit pipeline saved to disk (output.model_path), for predict.py
 """
 import os
 import shutil
@@ -21,6 +22,7 @@ import sys
 import tempfile
 from datetime import datetime
 
+import joblib
 import optuna
 import pandas as pd
 import yaml
@@ -97,8 +99,10 @@ def main(config_path: str = "config.yaml"):
     # week 8: feature selection is a learned step of the pipeline, switched on in config.yaml
     selection_config = config.get("feature_selection") or {}
     selection_enabled = selection_config.get("enabled", False)
+    imputer = config["preprocessing"].get("numeric_impute_strategy", "median")   # week 10
     print(f"Model: {model_type}   |   selection metric: {selection_metric}   |   {cv_config['n_splits']}-fold CV   |   "
-          f"feature selection: {'min_votes ' + str(selection_config.get('min_votes', 2)) if selection_enabled else 'off'}")
+          f"feature selection: {'min_votes ' + str(selection_config.get('min_votes', 2)) if selection_enabled else 'off'}   |   "
+          f"numeric imputer: {imputer}")
     print(f"Data:  {len(X_dev)} development rows   |   {len(X_test)} test rows locked away (not used)")
 
     # preprocessing lives inside the pipeline, so CV re-fits it on the training part of every fold
@@ -180,28 +184,38 @@ def main(config_path: str = "config.yaml"):
         kept = pipeline.named_steps["select"].get_feature_names_out(all_features)
         footer += f"\nFeatures kept: {len(kept)} of {len(all_features)}: {', '.join(kept)}"
 
+    # week 10: keep the final fitted pipeline, so predict.py can predict new people without training
+    output = config.get("output", {})
+    model_path = output.get("model_path", os.path.join(output.get("results_dir", "results"), "model.joblib"))
+    os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+    pipeline.set_params(memory=None)   # the cache folder is deleted at the end of the run; the saved model doesn't need it
+    joblib.dump(pipeline, model_path)
+    footer += f"\nModel saved for predict.py: {model_path}"
+
     # week 9: predict new, unlabelled rows with the refit pipeline (only if the config has `predict`)
     predict_config = config.get("predict")
     if predict_config:
-        footer += "\n" + predict_new_rows(pipeline, config, predict_config, engineered)
+        footer += "\n" + predict_new_rows(pipeline, config, predict_config)
     report += "\n" + footer + "\n"
 
     # week 7: the scoreboard: one row per run, with the score on each fold, so any two runs on the same data and folds can be compared with corrected_paired_test()
     row = {"run": run, "data": config["data"]["path"], "model": model_type, "tuned": tuning_enabled,
            "encoder": config["preprocessing"]["encoder"], "scaler": config["preprocessing"]["scaler"],
+           "imputer": imputer,
            "feature_selection": f"min_votes {pipeline.named_steps['select'].min_votes}" if selection_enabled else "off",
            "params": str(config["model"].get("params")),
            "tuned_params": str(study.best_params) if tuning_enabled else "",
            "metric": selection_metric, "mean": final_scores["validation"].mean(),
            "std": final_scores["validation"].std(ddof=1), "untuned": untuned, "floor": floor,
            **{f"fold_{i}": score for i, score in enumerate(final_scores["validation"], start=1)}}
-    output = config.get("output", {})
     runs = save_scores(output.get("scoreboard", "results/runs.csv"), row)
     same = runs[(runs["data"] == row["data"]) & (runs["metric"] == selection_metric)]   # only comparable runs
-    # runs saved before week 8 have no feature_selection value: they ran without selection
-    board = (same.assign(feature_selection=same["feature_selection"].fillna("off"))
+    # runs saved before week 8 have no feature_selection value: they ran without selection;
+    # runs saved before week 10 have no imputer value: they all used the median
+    board = (same.assign(feature_selection=same["feature_selection"].fillna("off"),
+                         imputer=same["imputer"].fillna("median"))
              .sort_values("mean", ascending=False)
-             [["run", "model", "tuned", "feature_selection", "mean", "std", "untuned", "floor"]]
+             [["run", "model", "tuned", "imputer", "feature_selection", "mean", "std", "untuned", "floor"]]
              .rename(columns={"mean": selection_metric})
              .to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     print(f"\nScoreboard (runs on the same data and metric, best first)\n{board}")

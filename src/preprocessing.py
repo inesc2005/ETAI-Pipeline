@@ -24,7 +24,9 @@ src/evaluate.py:fairness_report.
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401  (makes IterativeImputer importable)
+from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -81,6 +83,9 @@ def clean_dataset(df: pd.DataFrame, diagnostics_config: dict) -> pd.DataFrame:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")  # force back to numeric dtype
 
+    # week 10: only the rules for columns the file has. New people to predict have no COMPAS
+    # score (decile_score), and like every other step here a missing column is skipped
+    validity_rules = {col: rule for col, rule in validity_rules.items() if col in out.columns}
     if validity_rules:
         out = flag_invalid_values(out, validity_rules)  # impossible values -> NaN
 
@@ -215,31 +220,47 @@ def _instantiate(registry: dict, name: str):
     return factory if factory == "passthrough" else factory(**kwargs)
 
 
+# Week 10: numeric imputers, chosen with `numeric_impute_strategy` in the config. Each one gets the
+# preprocessing config (for its options) and a seed. All of them learn only from the feature columns,
+# never from the target, so they run the same way in cross-validation and on new people to predict.
+#   iterative     = MICE with ONE completed dataset (each gap gets the regression's best guess)
+#   random_forest = the missForest idea: the same loop, but each column is predicted by a random forest
+_NUMERIC_IMPUTERS = {
+    "median": lambda cfg, seed: SimpleImputer(strategy="median"),
+    "mean": lambda cfg, seed: SimpleImputer(strategy="mean"),
+    "knn": lambda cfg, seed: KNNImputer(n_neighbors=cfg.get("knn_neighbors", 5)),
+    "iterative": lambda cfg, seed: IterativeImputer(max_iter=cfg.get("imputer_max_iter", 10), random_state=seed),
+    "random_forest": lambda cfg, seed: IterativeImputer(
+        estimator=RandomForestRegressor(n_estimators=cfg.get("imputer_n_estimators", 50), min_samples_leaf=5,
+                                        random_state=seed, n_jobs=-1),
+        max_iter=cfg.get("imputer_max_iter", 10), random_state=seed),
+}
+
+
 def build_column_transformer(preprocessing_config: dict) -> ColumnTransformer:
     """
-    Builds a ColumnTransformer that imputes, encodes, and scales each column group (numeric, categorical, indicators) according to the config.
+    Builds a ColumnTransformer that scales + imputes the numeric columns, imputes + encodes the
+    categorical ones and passes the missingness flags through, according to the config.
+    Numeric columns are scaled FIRST, then imputed (week 10): KNN measures distances and the
+    model-based imputers predict one column from the others, so all columns must be on one scale.
+    The scalers ignore the gaps when they learn the scale.
     """
     numeric_features = preprocessing_config["numeric_features"]
     categorical_features = preprocessing_config["categorical_features"]
     mnar_columns = preprocessing_config.get("mnar_columns", [])
     numeric_strategy = preprocessing_config.get("numeric_impute_strategy", "median")
     categorical_strategy = preprocessing_config.get("categorical_impute_strategy", "most_frequent")
+    if numeric_strategy not in _NUMERIC_IMPUTERS:
+        raise ValueError(f"Unknown numeric_impute_strategy: {numeric_strategy}. Options: {list(_NUMERIC_IMPUTERS)}")
 
+    seed = preprocessing_config.get("random_state")
     scaler = _instantiate(_SCALER_REGISTRY, preprocessing_config.get("scaler", "standard"))
-    encoder = _ENCODER_REGISTRY[preprocessing_config.get("encoder", "onehot")](preprocessing_config.get("random_state"))
+    encoder = _ENCODER_REGISTRY[preprocessing_config.get("encoder", "onehot")](seed)
 
-    if numeric_strategy == "knn":
-        # KNN measures distances between rows, so the columns must be on a comparable scale
-        # first (the scalers ignore NaNs while fitting); otherwise `age` would dominate
-        numeric_pipeline = Pipeline([
-            ("scale", scaler),
-            ("impute", KNNImputer(n_neighbors=preprocessing_config.get("knn_neighbors", 5))),
-        ])
-    else:
-        numeric_pipeline = Pipeline([
-            ("impute", SimpleImputer(strategy=numeric_strategy)),
-            ("scale", scaler),
-        ])
+    numeric_pipeline = Pipeline([
+        ("scale", scaler),
+        ("impute", _NUMERIC_IMPUTERS[numeric_strategy](preprocessing_config, seed)),
+    ])
     categorical_pipeline = Pipeline([
         ("impute", SimpleImputer(strategy=categorical_strategy)),
         ("encode", encoder),
